@@ -1,0 +1,14 @@
+# Rime schema patch for rime-bilingual V0.2.
+# encoding: utf-8
+
+patch:
+  # rime_ice keeps uniquifier last. Insert immediately before it so comment
+  # changes are visible before candidates are wrapped for deduplication.
+  "engine/filters/@before last": lua_filter@*rime_bilingual
+
+  rime_bilingual:
+    enabled: true
+    cache_enabled: true
+    preserve_existing_comment: true
+    comment_prefix: ""
+    comment_separator: " · "

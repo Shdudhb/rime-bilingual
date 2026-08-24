@@ -1,0 +1,11 @@
+# Local Rime Bilingual runtime data and installation state
+/rime-bilingual/
+/.rime-bilingual*-manifest.json
+/.rime-bilingual-backups/
+/.rime-bilingual-rollback-*/
+
+# Temporary and backup files
+*.tmp
+*.bak
+*.sqlite-journal
+*.db-journal
