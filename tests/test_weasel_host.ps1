@@ -28,10 +28,8 @@ try {
     Assert-True ($patchedHash -ne $officialHash) 'patched fixture must differ from official image'
 
     $installSource = Get-Content -LiteralPath $installScript -Raw
-    $startIndex = $installSource.IndexOf('Start-SupportedWeasel $serverPath', [StringComparison]::Ordinal)
-    $deployIndex = $installSource.IndexOf('Invoke-WeaselDeploy $deployerPath', [StringComparison]::Ordinal)
-    Assert-True ($startIndex -ge 0 -and $deployIndex -gt $startIndex) 'host install must start patched Weasel before invoking /deploy'
-    Assert-True ($installSource -match 'Wait-Process\s+-Id\s+\$process\.Id\s+-Timeout\s+120') 'host deploy must be bounded by a timeout'
+    Assert-True ($installSource -match 'Start-SupportedWeasel\s+\$serverPath') 'host install must restart the patched Weasel server'
+    Assert-True ($installSource -notmatch 'WeaselDeployer|/deploy|Invoke-WeaselDeploy') 'host patch install must not invoke the GUI Weasel deployer'
 
     & $installScript -RimeUserDir $rimeRoot -ProjectRoot $projectRoot -WeaselDirectory $weaselRoot -PatchedWeaselServerPath $patchedFixture -DevelopmentNoProcessControl
     $manifestPath = Join-Path $rimeRoot '.rime-bilingual-weasel-host-manifest.json'

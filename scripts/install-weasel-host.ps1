@@ -156,24 +156,6 @@ function Start-SupportedWeasel([string]$ServerPath) {
     }
 }
 
-function Invoke-WeaselDeploy([string]$DeployerPath) {
-    $process = Start-Process -FilePath $DeployerPath -ArgumentList '/deploy' -WorkingDirectory (Split-Path -Parent $DeployerPath) -PassThru
-    $timedOut = $false
-    try { Wait-Process -Id $process.Id -Timeout 120 -ErrorAction Stop }
-    catch {
-        if ($null -ne (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
-            $timedOut = $true
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-            try { Wait-Process -Id $process.Id -Timeout 5 -ErrorAction SilentlyContinue } catch { }
-        }
-    }
-    if ($timedOut) { throw 'Weasel deploy timed out after 120 seconds.' }
-    $process.Refresh()
-    if ($process.ExitCode -ne 0) {
-        throw "Weasel deploy failed with exit code $($process.ExitCode)."
-    }
-}
-
 $RimeUserDir = Get-NormalizedPath $RimeUserDir
 $ProjectRoot = Get-NormalizedPath $ProjectRoot
 $WeaselDirectory = Get-NormalizedPath $WeaselDirectory
@@ -181,7 +163,6 @@ if ($RimeUserDir -eq [IO.Path]::GetPathRoot($RimeUserDir)) { throw 'RimeUserDir 
 if ($WeaselDirectory -eq [IO.Path]::GetPathRoot($WeaselDirectory)) { throw 'WeaselDirectory must not be a filesystem root.' }
 
 $serverPath = Assert-PathInside $WeaselDirectory (Join-Path $WeaselDirectory 'WeaselServer.exe') 'Weasel server'
-$deployerPath = Assert-PathInside $WeaselDirectory (Join-Path $WeaselDirectory 'WeaselDeployer.exe') 'Weasel deployer'
 $rimePath = Assert-PathInside $WeaselDirectory (Join-Path $WeaselDirectory 'rime.dll') 'Weasel rime.dll'
 $manifestPath = Assert-PathInside $RimeUserDir (Join-Path $RimeUserDir '.rime-bilingual-weasel-host-manifest.json') 'Host patch manifest'
 $backupRoot = Assert-PathInside $RimeUserDir (Join-Path $RimeUserDir '.rime-bilingual-weasel-host') 'Host patch backup root'
@@ -192,7 +173,7 @@ if (-not $PatchedWeaselServerPath) {
 }
 $PatchedWeaselServerPath = Get-NormalizedPath $PatchedWeaselServerPath
 
-foreach ($required in @($serverPath, $deployerPath, $rimePath, $PatchedWeaselServerPath)) {
+foreach ($required in @($serverPath, $rimePath, $PatchedWeaselServerPath)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Required file is missing: '$required'." }
 }
 if ((Get-Sha256 $rimePath) -cne $expectedRimeSha256) {
@@ -264,8 +245,6 @@ try {
     }
 
     if (-not $DevelopmentNoProcessControl) {
-        Start-SupportedWeasel $serverPath
-        Invoke-WeaselDeploy $deployerPath
         Start-SupportedWeasel $serverPath
     }
 
