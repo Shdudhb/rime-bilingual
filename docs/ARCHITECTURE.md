@@ -11,7 +11,8 @@ Rime Lua filter / processor
   -> native worker thread -> UIA password check -> loopback HTTP
   -> Helper v2 -> SQLite cache -> miss 才呼叫 llama-server
   -> native completion ring
-  -> 下一次真實按鍵或自然 callback -> try_poll -> 核對保存的 genuine refs -> comment
+  -> DLL runtime mount -> bounded Weasel FOCUS_IN wake
+  -> Rime refresh -> try_poll -> 核對保存的 genuine refs -> comment
 ```
 
 V0.3 不傳送 recent context（固定 `context: ""`），不實作英文上屏快捷鍵，也不管理 V0.6 的模型載入／600 秒 idle unload。SQLite cache、非同步 request、timeout、dedup、generation + SHA-256 fingerprint stale rejection 和打字熱路徑零等待屬本版。
@@ -40,10 +41,12 @@ bridge 的逐函式契約、fingerprint framing、limits 與 Helper v2 wire form
 0. `rime_bilingual.init` 只在初始化時讀取 `build/weasel.yaml`。只有編譯後的 Weasel candidate layout 明確為 `style/layout/type: vertical`，或舊式 `style/horizontal: false` 時才啟用 bilingual；橫列、未知或讀取失敗都 fail closed，dictionary/cache/AI 註解與 async page tracking 一併停用。typing callback 不讀 Weasel config。
 1. filter 逐候選先查 dictionary，再查 schema init 時載入的 canonical snapshot。命中立即使用並標記 `local_hit=true`；只有兩者皆 miss 的 slot 可進 AI batch。
 2. filter 先從 composition 的 `selected_index` 與 schema `page_size` 算出目前可視頁的 `page_start`，再依 upstream `input:iter()` 的 lazy contract 逐候選處理並 yield。只有 absolute index 落在該可視頁範圍內的候選會被保存，最多 `page_size`（上限 20）個 refs/identity；Rime 為 uniquifier 或後續頁面預取的候選不得建立新的 AI batch。取得該可視頁最後一個 candidate 時，先對完整頁 misses 呼叫一次 `try_submit`，再 yield 該最後一個 candidate；最後不足一頁時只在 iterator 已確認 exhausted 後 submit。保存 `{slot, genuine_ref, immutable_identity, local_hit}` 的集合只代表一個確切 `(generation, fingerprint)`；不得逐候選 inference、不得為了湊頁而連續 consume upstream 卻不 yield，也不得從 filter 反向呼叫 `segment.menu:prepare()`。
-3. bridge worker 將 terminal `ready` completion 成功放入 bounded completion ring 後，只做一次 non-blocking `PostMessageW` 到 Weasel 0.17.4 IPC server 的 hidden message-loop window。worker **不得**呼叫任何 Rime API、不得等待 UI thread，也不得送 synthetic key。patched Weasel 在自己的主執行緒收到 private `WM_APP` message 後，只對目前 active 且仍 `is_composing` 的 session toggle schema-local `_rime_bilingual_refresh` option；librime 的 option update 會在同一主執行緒呼叫 `RefreshNonConfirmedComposition()`，不提交文字、不改 input，也不等待 Helper/model。
-4. native wakeup 造成 filter 重新執行；`prepare_filter()` 在該輪 page materialization 時先 `try_poll`，只有 generation/fingerprint 完全匹配的 ready result 才可在 candidate `yield` **之前**寫入 comment。PageUp/PageDown 或頁內 highlight 完成後，`Context.update_notifier` 仍只觀察已更新的 `selected_index`；若 input 未改變而 page_start 改變，callback 只以 `candidate_count()` / `get_candidate_at()` 讀取 librime 已 materialize 的目的頁，建立新 generation 並 submit，**不得**呼叫 `menu:prepare()`。input 編輯仍由正常 filter path 處理，不由 notifier 重複 batching。generation、composition、page 或 identity 一改變，必須在建立新集合前清除舊 refs。component fini 斷開 notifier 並清除 state；本版沒有 commit/cancel notifier，因此 commit/cancel 後由下一個真實鍵事件的 processor 在 poll **之前**偵測 composition 為空並清除，不得先 poll 舊 pair。不得在不同頁或不同 generation 保留/使用 ref。
-5. 舊 generation、不同頁、不同順序、不同 candidate identity、local hit 或數量不符一律丟棄；AI 永遠不得覆寫 dictionary/snapshot comment。
-6. 不得送 synthetic key、不得用 timer polling/刷新、不得讓 bridge worker 直接呼叫 Rime API。只有 terminal `ready` completion publication 才可 `PostMessage` 喚醒 Weasel；pending/failed/stale/expired completion 不得觸發 UI refresh。Weasel handler 必須在主執行緒重新確認 active composing session 後才 toggle `_rime_bilingual_refresh`，其餘狀態一律忽略。
+3. bridge DLL 由 Rime Lua 正常 `package.loadlib()` 載入官方 `WeaselServer.exe` process；**磁碟上的官方 EXE 不修改、不替換**。runtime mount 只在 exact Weasel 0.17.4 `WeaselServer.exe` SHA-256 與 pinned `rime.dll` SHA-256 都匹配時安裝。它在 process 記憶體內以 IAT hook 觀察官方 `KERNEL32!ReadFile` 收到的 Weasel named-pipe `PipeMessage`，只接受 12-byte、pipe handle、已知 `WM_APP+1..15` command；由真實 `PROCESS_KEY_EVENT` / `FOCUS_IN` / `FOCUS_OUT` 等 request 被動追蹤 active IPC session。filter 在 `PROCESS_KEY_EVENT` 內 submit 時保存該 request 的 IPC session 與 foreground HWND，worker 本身**不得**呼叫任何 Rime API。
+4. bridge worker 將 terminal `ready` completion 成功放入 bounded completion ring 後，只有保存的 IPC session 仍為 active、foreground HWND 仍相同時，才以最多 50 ms timeout 的 `CallNamedPipeW` 對官方 `\\.\pipe\<user>\WeaselNamedPipe` 送出一個既有 `WEASEL_IPC_FOCUS_IN` request，並在 `wParam` 帶 private `RBIL` marker。若 focus/session 在 preflight 後又競態改變，ReadFile hook 會在 upstream dispatch 前把該 wake 改寫成無副作用 `ECHO`，不得讓舊 session 被重新標成 active。官方 `FocusIn()` 本身先執行 `_UpdateUI(ipc_id)` 再維持同一 active session，因此不需要新增 Weasel IPC command、synthetic key、timer 或 patched server binary。
+5. runtime mount 同時只包裝 pinned librime 1.13.1 `RimeApi.get_status` function-table entry。只有帶 `RBIL` marker、仍對應 active IPC session 的官方 `_UpdateUI()` 進入 `get_status(session_id)` 時才消耗 wake；wrapper 先用原始 `get_status` 確認 `is_composing`，再透過原始 `get_option` / `set_option` toggle schema-local `_rime_bilingual_refresh`。此時正在 Weasel 自己的 serialized API handler 內，librime option update 會呼叫 `RefreshNonConfirmedComposition()`；接著 upstream `_UpdateUI()` 繼續讀取新 status/context。任何 hash、PE import、Rime API table、focus/session 或 composing 條件不符都 fail closed，只缺英文。
+6. native wakeup 造成 filter 重新執行；`prepare_filter()` 在該輪 page materialization 時先 `try_poll`，只有 generation/fingerprint 完全匹配的 ready result 才可在 candidate `yield` **之前**寫入 comment。PageUp/PageDown 或頁內 highlight 完成後，`Context.update_notifier` 仍只觀察已更新的 `selected_index`；若 input 未改變而 page_start 改變，callback 只以 `candidate_count()` / `get_candidate_at()` 讀取 librime 已 materialize 的目的頁，建立新 generation 並 submit，**不得**呼叫 `menu:prepare()`。input 編輯仍由正常 filter path 處理，不由 notifier 重複 batching。generation、composition、page 或 identity 一改變，必須在建立新集合前清除舊 refs。component fini 斷開 notifier 並清除 state；本版沒有 commit/cancel notifier，因此 commit/cancel 後由下一個真實鍵事件的 processor 在 poll **之前**偵測 composition 為空並清除，不得先 poll 舊 pair。不得在不同頁或不同 generation 保留/使用 ref。
+7. 舊 generation、不同頁、不同順序、不同 candidate identity、local hit 或數量不符一律丟棄；AI 永遠不得覆寫 dictionary/snapshot comment。
+8. 不得送 synthetic key、不得用 timer polling/刷新、不得讓 bridge worker 直接呼叫 Rime API。只有 terminal `ready` completion publication 且保存的 wake target 仍有效時才可發 bounded named-pipe wake；pending/failed/stale/expired completion 不得觸發 UI refresh。runtime hook 只存在於目前 Weasel process 記憶體，重啟 Weasel 即完全恢復官方 executable 行為。
 
 因此 AI 完成後即使使用者完全停住不按鍵，也會由 native completion message 喚醒 Weasel/Rime，filter 自動重跑並補上英文；**不需要 timer、synthetic key 或下一個真實鍵盤事件。** Helper/bridge/Weasel 任一環節失敗時只缺英文，中文候選與選字不得受影響。
 
@@ -77,7 +80,7 @@ Lua 不傳 composition 或 context；V0.3 request 只含需要翻譯的候選文
 - 模擬快速連續輸入、選取移動和 PageUp/PageDown，舊 generation/fingerprint 結果不顯示，順序與選取不變。
 - UIA unknown/error/`IsPassword=true`、foreground PID 改變、非 loopback endpoint 均為零 HTTP request。
 - Helper v1 測試仍通過；v2 success/error/limits/cache/dedup/timeout 測試通過。
-- 驗證停住不按鍵時不主動刷新；filter 不重跑的情況下，下一次真實鍵盤事件會由 processor 對仍有效 refs 套用 ready translation，且 generation/page/identity 改變時不會套到舊 refs。
+- 驗證 cache miss 頁在 AI 完成後**完全不按鍵**也會自動重跑 filter 並補上英文；快速切換輸入框或 FocusOut 時，晚到 completion 不得重新喚醒舊 session。若 runtime mount hash/ABI 檢查失敗，則 fail closed 為純中文/local annotation，不能修改或替換官方 `WeaselServer.exe`。
 - 實機驗證正常拼音、Space/數字/方向鍵選字、PageUp/PageDown、直列候選，以及 Helper/model unavailable 時無可感知卡頓。雙語翻譯 UI 僅支援直列；橫列不是本功能的驗收模式。
 
 ---

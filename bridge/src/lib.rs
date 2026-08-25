@@ -1,5 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 
+mod weasel_mount;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
@@ -13,11 +15,7 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
 use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
-use windows::Win32::Foundation::{LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetForegroundWindow, GetWindowThreadProcessId, PostMessageW, WM_APP,
-};
-use windows::core::PCWSTR;
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 const PROTOCOL_VERSION: u64 = 2;
 const MAX_CANDIDATES: usize = 20;
@@ -26,32 +24,8 @@ const MAX_HTTP_BODY: usize = 32 * 1024;
 const PENDING_CAPACITY: usize = 8;
 const COMPLETION_CAPACITY: usize = 32;
 const RETENTION: Duration = Duration::from_secs(30);
-const WEASEL_BILINGUAL_REFRESH_MESSAGE: u32 = WM_APP + 0x3a1;
 const EXPECTED_RIME_SHA256: &str =
     "2D8F1BC3737635A11D9FB1BFCA4DC9E70533633930A8A0142A81CA879C39C45B";
-
-fn wake_weasel_for_ready_completion() -> bool {
-    // The worker must never touch librime directly. Weasel's IPC server owns
-    // a hidden message-loop window named/classed WeaselIPCWindow_1.0. A
-    // posted message is non-blocking and transfers the refresh request back
-    // to Weasel's main thread, where the patched 0.17.4 server can safely
-    // toggle a local Rime option and rebuild the active composition.
-    let name: Vec<u16> = "WeaselIPCWindow_1.0\0".encode_utf16().collect();
-    let Ok(hwnd) = (unsafe {
-        FindWindowW(PCWSTR(name.as_ptr()), PCWSTR(name.as_ptr()))
-    }) else {
-        return false;
-    };
-    unsafe {
-        PostMessageW(
-            hwnd,
-            WEASEL_BILINGUAL_REFRESH_MESSAGE,
-            WPARAM(0),
-            LPARAM(0),
-        )
-        .is_ok()
-    }
-}
 
 #[repr(C)]
 pub struct lua_State {
@@ -204,6 +178,7 @@ struct Job {
     request_id: String,
     page: Page,
     misses: Vec<Miss>,
+    wake_target: Option<weasel_mount::WakeTarget>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -707,8 +682,8 @@ fn worker(runtime: Arc<Runtime>, rx: mpsc::Receiver<Job>, safety: Arc<dyn Safety
         } else {
             runtime.dropped.fetch_add(1, Ordering::Relaxed);
         }
-        if published_ready {
-            let _ = wake_weasel_for_ready_completion();
+        if published_ready && let Some(target) = job.wake_target {
+            let _ = weasel_mount::wake(target);
         }
     }
 }
@@ -931,6 +906,12 @@ unsafe extern "C" fn lua_configure(l: *mut lua_State) -> c_int {
                     result(a, l, "disabled");
                     set_string(a, l, "error", "abi_mismatch");
                 }
+            } else if let Err(e) = weasel_mount::install() {
+                *state = GlobalState::Disabled(e);
+                unsafe {
+                    result(a, l, "disabled");
+                    set_string(a, l, "error", e);
+                }
             } else {
                 let (tx, rx) = mpsc::sync_channel(PENDING_CAPACITY);
                 let rt = Arc::new(Runtime {
@@ -1084,11 +1065,13 @@ unsafe extern "C" fn lua_try_submit(l: *mut lua_State) -> c_int {
     drop(completions);
     let id_num = rt.next_id.fetch_add(1, Ordering::Relaxed);
     let request_id = format!("rime-{}-{id_num:x}", page.generation);
+    let wake_target = weasel_mount::capture_wake_target();
     active.insert(p.clone());
     match rt.tx.try_send(Job {
         request_id: request_id.clone(),
         page,
         misses,
+        wake_target,
     }) {
         Ok(()) => {
             rt.pending.fetch_add(1, Ordering::Relaxed);
@@ -1404,6 +1387,7 @@ mod tests {
                 slot: 0,
                 text: "今天".into(),
             }],
+            wake_target: None,
         };
         let config = Config {
             endpoint: format!("http://127.0.0.1:{port}"),
