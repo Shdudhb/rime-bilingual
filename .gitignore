@@ -18,6 +18,7 @@
 /config.json
 /helper/target/
 /bridge/target/
+/deployer/target/
 *.gguf
 *.ggml
 *.zip
