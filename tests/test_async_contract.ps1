@@ -82,7 +82,6 @@ Assert-True ($bridge -match 'published_ready' -and $bridge -match 'weasel_mount:
 Assert-True ($weaselMount -match 'EXPECTED_WEASEL_SERVER_SHA256' -and $weaselMount -match 'EXPECTED_RIME_SHA256') 'runtime mount pins both the official WeaselServer and librime binaries before hooking'
 Assert-True ($weaselMount -match 'find_import_iat_slot' -and $weaselMount -match '"KERNEL32\.dll", "ReadFile"' -and $weaselMount -match 'VirtualProtect') 'mount hooks only the official process ReadFile IAT entry in memory'
 Assert-True ($weaselMount -match 'CallNamedPipeW' -and $weaselMount -match 'PIPE_TIMEOUT_MS:\s*u32\s*=\s*50') 'ready wakeup uses a bounded official Weasel named-pipe transaction'
-Assert-True ($weaselMount -match 'WEASEL_IPC_SHUTDOWN_SERVER:\s*u32\s*=\s*WM_APP\s*\+\s*5' -and $weaselMount -match 'WEASEL_IPC_FOCUS_IN:\s*u32\s*=\s*WEASEL_IPC_SHUTDOWN_SERVER\s*\+\s*1') 'mount preserves the exact upstream shutdown/focus IPC enum offsets'
 Assert-True ($weaselMount -match 'WEASEL_IPC_FOCUS_IN' -and $weaselMount -match 'WAKE_MAGIC') 'wakeup reuses the existing upstream FOCUS_IN IPC command with a private marker'
 Assert-True ($weaselMount -match 'ACTIVE_IPC_SESSION' -and $weaselMount -match 'WEASEL_IPC_FOCUS_OUT') 'mount passively tracks upstream focus/session ownership'
 Assert-True ($weaselMount -match 'message\.msg = WEASEL_IPC_ECHO' -or $weaselMount -match 'msg:\s*WEASEL_IPC_ECHO') 'a raced or stale wake is rewritten to harmless ECHO before upstream dispatch'

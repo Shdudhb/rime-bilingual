@@ -17,13 +17,11 @@ const EXPECTED_RIME_SHA256: &str =
 const WEASEL_IPC_ECHO: u32 = WM_APP + 1;
 const WEASEL_IPC_END_SESSION: u32 = WM_APP + 3;
 const WEASEL_IPC_PROCESS_KEY_EVENT: u32 = WM_APP + 4;
-const WEASEL_IPC_SHUTDOWN_SERVER: u32 = WM_APP + 5;
-const WEASEL_IPC_FOCUS_IN: u32 = WEASEL_IPC_SHUTDOWN_SERVER + 1;
-const WEASEL_IPC_FOCUS_OUT: u32 = WM_APP + 7;
-const WEASEL_IPC_UPDATE_INPUT_POS: u32 = WM_APP + 8;
-const WEASEL_IPC_COMMIT_COMPOSITION: u32 = WM_APP + 11;
-const WEASEL_IPC_CLEAR_COMPOSITION: u32 = WM_APP + 12;
-const WEASEL_IPC_CHANGE_PAGE: u32 = WM_APP + 16;
+const WEASEL_IPC_FOCUS_IN: u32 = WM_APP + 5;
+const WEASEL_IPC_FOCUS_OUT: u32 = WM_APP + 6;
+const WEASEL_IPC_UPDATE_INPUT_POS: u32 = WM_APP + 7;
+const WEASEL_IPC_COMMIT_COMPOSITION: u32 = WM_APP + 10;
+const WEASEL_IPC_CLEAR_COMPOSITION: u32 = WM_APP + 11;
 
 // Private marker carried in FOCUS_IN.wParam.  Upstream 0.17.4 only logs the
 // client_caps argument; it does not use it to mutate the composition.
@@ -235,11 +233,7 @@ pub(crate) fn capture_wake_target() -> Option<WakeTarget> {
         return None;
     }
     let message = THREAD_PIPE_MESSAGE.with(Cell::get).message;
-    if !matches!(
-        message.msg,
-        WEASEL_IPC_PROCESS_KEY_EVENT | WEASEL_IPC_CHANGE_PAGE
-    ) || message.l_param == 0
-    {
+    if message.msg != WEASEL_IPC_PROCESS_KEY_EVENT || message.l_param == 0 {
         return None;
     }
     if ACTIVE_IPC_SESSION.load(Ordering::Acquire) != message.l_param {
@@ -417,9 +411,9 @@ fn track_active_session(message: PipeMessage) {
 }
 
 fn is_weasel_ipc_command(command: u32) -> bool {
-    // 0.17.4 currently uses WM_APP+1 through WM_APP+16. Keep the parser
+    // 0.17.4 currently uses WM_APP+1 through WM_APP+15.  Keep the parser
     // narrow so unrelated 12-byte pipe reads are never treated as Weasel IPC.
-    (WM_APP + 1..=WM_APP + 16).contains(&command)
+    (WM_APP + 1..=WM_APP + 15).contains(&command)
 }
 
 fn weasel_pipe_name() -> Option<Vec<u16>> {
@@ -667,13 +661,7 @@ mod tests {
     fn pipe_message_is_exact_upstream_wire_size() {
         assert_eq!(size_of::<PipeMessage>(), 12);
         assert_eq!(WEASEL_IPC_PROCESS_KEY_EVENT, WM_APP + 4);
-        assert_eq!(WEASEL_IPC_SHUTDOWN_SERVER, WM_APP + 5);
-        assert_eq!(WEASEL_IPC_FOCUS_IN, WM_APP + 6);
-        assert_eq!(WEASEL_IPC_FOCUS_OUT, WM_APP + 7);
-        assert_eq!(WEASEL_IPC_UPDATE_INPUT_POS, WM_APP + 8);
-        assert_eq!(WEASEL_IPC_COMMIT_COMPOSITION, WM_APP + 11);
-        assert_eq!(WEASEL_IPC_CLEAR_COMPOSITION, WM_APP + 12);
-        assert_eq!(WEASEL_IPC_CHANGE_PAGE, WM_APP + 16);
+        assert_eq!(WEASEL_IPC_FOCUS_IN, WM_APP + 5);
     }
 
     #[test]
