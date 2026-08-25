@@ -9,3 +9,18 @@
 *.bak
 *.sqlite-journal
 *.db-journal
+
+# Local AI assets, downloads, logs, and machine-specific configuration
+/models/
+/runtime/
+/logs/
+/.downloads/
+/config.json
+/helper/target/
+/bridge/target/
+*.gguf
+*.ggml
+*.zip
+*.exe
+*.dll
+/*.pid.json

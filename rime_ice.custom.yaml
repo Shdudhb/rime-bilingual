@@ -1,14 +1,24 @@
-# Rime schema patch for rime-bilingual V0.2.
+# Rime schema patch for rime-bilingual V0.3.
 # encoding: utf-8
 
 patch:
+  # Observe every real key without consuming it. This bounded poll is needed
+  # because PageUp/PageDown can change selected_index without an update notifier.
+  "engine/processors/@before 0": lua_processor@*rime_bilingual_async
+
   # rime_ice keeps uniquifier last. Insert immediately before it so comment
   # changes are visible before candidates are wrapped for deduplication.
   "engine/filters/@before last": lua_filter@*rime_bilingual
 
   rime_bilingual:
+    # The Lua init path also requires the compiled Weasel layout to be vertical.
+    # Horizontal/unknown layouts fail closed with bilingual annotations disabled.
     enabled: true
     cache_enabled: true
+    async_enabled: true
+    helper_endpoint: "http://127.0.0.1:18081"
+    request_timeout_ms: 3000
+    expected_rime_sha256: "2D8F1BC3737635A11D9FB1BFCA4DC9E70533633930A8A0142A81CA879C39C45B"
     preserve_existing_comment: true
     comment_prefix: ""
     comment_separator: " · "

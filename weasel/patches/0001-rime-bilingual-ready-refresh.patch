@@ -1,0 +1,107 @@
+diff --git a/include/WeaselIPC.h b/include/WeaselIPC.h
+index 2d61c84..d29a3ce 100644
+--- a/include/WeaselIPC.h
++++ b/include/WeaselIPC.h
+@@ -9,5 +9,6 @@
+ #define WEASEL_IPC_WINDOW L"WeaselIPCWindow_1.0"
+ #define WEASEL_IPC_PIPE_NAME L"WeaselNamedPipe"
++#define WEASEL_BILINGUAL_REFRESH_MESSAGE (WM_APP + 0x3a1)
+ 
+ #define WEASEL_IPC_METADATA_SIZE 1024
+ #define WEASEL_IPC_BUFFER_SIZE (4 * 1024)
+@@ -81,4 +82,5 @@ struct RequestHandler {
+  virtual void EndMaintenance() {}
+  virtual void SetOption(DWORD session_id, const std::string& opt, bool val) {}
+  virtual void UpdateColorTheme(BOOL darkMode) {}
++  virtual void RefreshBilingual() {}
+ };
+diff --git a/include/RimeWithWeasel.h b/include/RimeWithWeasel.h
+index 995a9f1..2dba265 100644
+--- a/include/RimeWithWeasel.h
++++ b/include/RimeWithWeasel.h
+@@ -61,6 +61,7 @@ class RimeWithWeaselHandler : public weasel::RequestHandler {
+                          const std::string& opt,
+                          bool val);
+   virtual void UpdateColorTheme(BOOL darkMode);
++  virtual void RefreshBilingual();
+ 
+   void OnUpdateUI(std::function<void()> const& cb);
+ 
+diff --git a/WeaselIPCServer/WeaselServerImpl.h b/WeaselIPCServer/WeaselServerImpl.h
+index 338b42b..78402e5 100644
+--- a/WeaselIPCServer/WeaselServerImpl.h
++++ b/WeaselIPCServer/WeaselServerImpl.h
+@@ -28,6 +28,7 @@ class ServerImpl : public CWindowImpl<ServerImpl, CWindow, ServerWinTraits>
+   MESSAGE_HANDLER(WM_DWMCOLORIZATIONCOLORCHANGED, OnColorChange)
+   MESSAGE_HANDLER(WM_SETTINGCHANGE, OnColorChange)
+   MESSAGE_HANDLER(WM_COMMAND, OnCommand)
++  MESSAGE_HANDLER(WEASEL_BILINGUAL_REFRESH_MESSAGE, OnBilingualRefresh)
+   END_MSG_MAP()
+ 
+   LRESULT OnColorChange(UINT uMsg,
+@@ -48,2 +49,6 @@ class ServerImpl : public CWindowImpl<ServerImpl, CWindow, ServerWinTraits>
+  LRESULT OnCommand(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled);
++  LRESULT OnBilingualRefresh(UINT uMsg,
++                             WPARAM wParam,
++                             LPARAM lParam,
++                             BOOL& bHandled);
+  DWORD OnCommand(WEASEL_IPC_COMMAND uMsg, DWORD wParam, DWORD lParam);
+diff --git a/WeaselIPCServer/WeaselServerImpl.cpp b/WeaselIPCServer/WeaselServerImpl.cpp
+index 08f4287..05aba1f 100644
+--- a/WeaselIPCServer/WeaselServerImpl.cpp
++++ b/WeaselIPCServer/WeaselServerImpl.cpp
+@@ -131,6 +131,15 @@ LRESULT ServerImpl::OnCommand(UINT uMsg,
+   return 0;
+ }
+ 
++LRESULT ServerImpl::OnBilingualRefresh(UINT uMsg,
++                                       WPARAM wParam,
++                                       LPARAM lParam,
++                                       BOOL& bHandled) {
++  if (m_pRequestHandler)
++    m_pRequestHandler->RefreshBilingual();
++  return 0;
++}
++
+ DWORD ServerImpl::OnCommand(WEASEL_IPC_COMMAND uMsg,
+                             DWORD wParam,
+                             DWORD lParam) {
+diff --git a/RimeWithWeasel/RimeWithWeasel.cpp b/RimeWithWeasel/RimeWithWeasel.cpp
+index 084957d..893d4e9 100644
+--- a/RimeWithWeasel/RimeWithWeasel.cpp
++++ b/RimeWithWeasel/RimeWithWeasel.cpp
+@@ -550,6 +550,34 @@ void RimeWithWeaselHandler::SetOption(WeaselSessionId ipc_id,
+   }
+ }
+ 
++void RimeWithWeaselHandler::RefreshBilingual() {
++  if (m_disabled || !m_active_session)
++    return;
++
++  auto it = m_session_status_map.find(m_active_session);
++  if (it == m_session_status_map.end())
++    return;
++  RimeSessionId session_id = it->second.session_id;
++  if (!session_id || !rime_api->find_session(session_id))
++    return;
++
++  RIME_STRUCT(RimeStatus, status);
++  if (!rime_api->get_status(session_id, &status))
++    return;
++  const bool composing = !!status.is_composing;
++  rime_api->free_status(&status);
++  if (!composing)
++    return;
++
++  // set_option is a public librime API. While composing, option updates call
++  // RefreshNonConfirmedComposition() on this same Weasel/Rime main thread.
++  // The option is schema-local and exists only to trigger one safe rebuild.
++  constexpr char kRefreshOption[] = "_rime_bilingual_refresh";
++  Bool next = !rime_api->get_option(session_id, kRefreshOption);
++  rime_api->set_option(session_id, kRefreshOption, next);
++  _UpdateUI(m_active_session);
++}
++
+ void RimeWithWeaselHandler::OnUpdateUI(std::function<void()> const& cb) {
+   _UpdateUICallback = cb;
+ }

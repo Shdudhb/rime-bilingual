@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "bind_host": "127.0.0.1",
+  "port": 18080,
+  "runtime_version": "b10516",
+  "runtime_path": "%LOCALAPPDATA%\\RimeBilingual\\runtime\\llama.cpp\\b10516\\llama-server.exe",
+  "model_profile": "gemma",
+  "model_identity": "gemma-3-1b-it-qat-q4_0",
+  "model_repository": "google/gemma-3-1b-it-qat-q4_0-gguf",
+  "model_commit": "d1be121d36172a4b0b964657e2ee859d61138593",
+  "model_path": "%LOCALAPPDATA%\\RimeBilingual\\models\\gemma-3-1b-it-qat-q4_0\\gemma-3-1b-it-q4_0.gguf",
+  "context_size": 512,
+  "temperature": 0.1,
+  "timeout_seconds": 30,
+  "gpu_layers": 999
+}

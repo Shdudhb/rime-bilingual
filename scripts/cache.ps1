@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('init', 'put', 'import', 'publish', 'validate')]
+    [ValidateSet('init', 'put', 'import', 'purge-model', 'publish', 'validate')]
     [string]$Command,
 
     [string]$DatabasePath,
@@ -77,6 +77,9 @@ switch ($Command) {
             -DatabasePath $DatabasePath `
             -InputPath $InputPath `
             -DefaultSource $DefaultSource)
+    }
+    'purge-model' {
+        Write-Output (Remove-RimeBilingualModelCacheEntries -DatabasePath $DatabasePath)
     }
     'publish' {
         Write-Output (Publish-RimeBilingualCacheSnapshot `

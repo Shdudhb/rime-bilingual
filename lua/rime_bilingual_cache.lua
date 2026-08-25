@@ -12,11 +12,13 @@ local M = {}
 local MAX_ENTRIES = 10000
 local MAX_STRING_BYTES = 4096
 local MAX_FILE_BYTES = 16 * 1024 * 1024
+local MAX_LAYOUT_FILE_BYTES = 1024 * 1024
 local MAX_REVISION = 2147483647
 
 M.MAX_ENTRIES = MAX_ENTRIES
 M.MAX_STRING_BYTES = MAX_STRING_BYTES
 M.MAX_FILE_BYTES = MAX_FILE_BYTES
+M.MAX_LAYOUT_FILE_BYTES = MAX_LAYOUT_FILE_BYTES
 
 local function emit_warning(warn, message)
   if type(warn) == "function" then
@@ -64,6 +66,109 @@ local function read_bounded_file(path)
     return nil, "snapshot file cannot be read completely"
   end
   return text
+end
+
+local function read_bounded_layout_file(path)
+  if type(io) ~= "table" or type(io.open) ~= "function" then
+    return nil, "file access is unavailable in this Lua runtime"
+  end
+  local opened, file = pcall(io.open, path, "rb")
+  if not opened or not file then
+    return nil, "compiled Weasel config is missing or unreadable"
+  end
+  local seek_ok, size = pcall(file.seek, file, "end")
+  if not seek_ok or type(size) ~= "number" or size < 0 then
+    pcall(file.close, file)
+    return nil, "compiled Weasel config size is unavailable"
+  end
+  if size > MAX_LAYOUT_FILE_BYTES then
+    pcall(file.close, file)
+    return nil, "compiled Weasel config is too large"
+  end
+  if not pcall(file.seek, file, "set", 0) then
+    pcall(file.close, file)
+    return nil, "compiled Weasel config cannot be rewound"
+  end
+  local read_ok, text = pcall(file.read, file, MAX_LAYOUT_FILE_BYTES + 1)
+  pcall(file.close, file)
+  if not read_ok or type(text) ~= "string" or #text ~= size then
+    return nil, "compiled Weasel config cannot be read completely"
+  end
+  return text
+end
+
+local function parse_vertical_layout(text)
+  local in_style = false
+  local style_indent = nil
+  local in_layout = false
+  local layout_indent = nil
+  local horizontal = nil
+  local layout_type = nil
+
+  for line in (text .. "\n"):gmatch("(.-)\r?\n") do
+    local leading, content = line:match("^(%s*)(.-)%s*$")
+    if leading and not leading:find("\t", 1, true) then
+      local indent = #leading
+      content = content:gsub("%s+#.*$", "")
+      if content ~= "" and content:sub(1, 1) ~= "#" then
+        if not in_style then
+          if indent == 0 and content == "style:" then
+            in_style = true
+            style_indent = indent
+          end
+        else
+          if indent <= style_indent then
+            break
+          end
+          if in_layout and indent <= layout_indent then
+            in_layout = false
+            layout_indent = nil
+          end
+          if indent == style_indent + 2 then
+            local value = content:match("^horizontal:%s*(%a+)%s*$")
+            if value == "true" or value == "false" then
+              horizontal = value == "true"
+            elseif content == "layout:" then
+              in_layout = true
+              layout_indent = indent
+            end
+          elseif in_layout and indent == layout_indent + 2 then
+            local value = content:match("^type:%s*([%w_+%-]+)%s*$")
+            if value ~= nil then
+              layout_type = value
+            end
+          end
+        end
+      end
+    end
+  end
+
+  if layout_type ~= nil then
+    return layout_type == "vertical"
+  end
+  if horizontal ~= nil then
+    return horizontal == false
+  end
+  return false
+end
+
+local function is_vertical_layout(user_data_dir, warn)
+  if type(user_data_dir) ~= "string" or user_data_dir == "" then
+    emit_warning(warn, "[rime_bilingual] translation disabled: Rime user data directory is unavailable")
+    return false
+  end
+  local base = user_data_dir:gsub("[\\/]$", "")
+  local path = base .. "/build/weasel.yaml"
+  local text, read_error = read_bounded_layout_file(path)
+  if not text then
+    emit_warning(warn, "[rime_bilingual] translation disabled: " .. read_error)
+    return false
+  end
+  if not parse_vertical_layout(text) then
+    emit_warning(warn, "[rime_bilingual] translation disabled: Weasel candidate layout is not vertical")
+    return false
+  end
+  return true
 end
 
 local function valid_utf8(value)
@@ -268,5 +373,6 @@ local function load_snapshot(path, warn)
 end
 
 M.load = load_snapshot
+M.is_vertical_layout = is_vertical_layout
 
 return M

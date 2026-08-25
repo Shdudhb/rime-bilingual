@@ -1,0 +1,27 @@
+[package]
+name = "rime-bilingual-bridge"
+version = "0.3.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+name = "rime_bilingual_bridge"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_UI_Accessibility",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+

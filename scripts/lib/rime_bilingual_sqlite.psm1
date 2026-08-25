@@ -839,6 +839,53 @@ function Put-RimeBilingualCacheEntry {
     }
 }
 
+function Remove-RimeBilingualModelCacheEntries {
+    [CmdletBinding()]
+    param(
+        [string]$DatabasePath = (Get-RimeBilingualDefaultPaths).DatabasePath
+    )
+
+    $database = Ensure-RimeBilingualSchema -DatabasePath $DatabasePath
+    try {
+        return Invoke-RimeBilingualTransaction -Database $database -Body {
+            param($transactionDatabase)
+
+            $deleted = [int64](Invoke-RimeBilingualSql `
+                -Database $transactionDatabase `
+                -Sql "DELETE FROM translations WHERE substr(source, 1, 6) = 'model:'")
+
+            $revisionRows = @(Invoke-RimeBilingualSql `
+                -Database $transactionDatabase `
+                -Sql 'SELECT revision FROM cache_meta WHERE id = ?' `
+                -Parameters @([int64]1) `
+                -Query)
+            if ($revisionRows.Count -ne 1) {
+                throw 'SQLite cache_meta revision row is missing.'
+            }
+            $revision = [int64]$revisionRows[0].revision
+            if ($deleted -gt 0) {
+                $revision = Update-RimeBilingualRevision -Database $transactionDatabase
+            }
+
+            $countRows = @(Invoke-RimeBilingualSql `
+                -Database $transactionDatabase `
+                -Sql 'SELECT COUNT(*) AS entry_count FROM translations' `
+                -Query)
+            if ($countRows.Count -ne 1) {
+                throw 'SQLite cache entry count query failed.'
+            }
+            return [pscustomobject]@{
+                DeletedCount = $deleted
+                Revision     = [int64]$revision
+                EntryCount   = [int64]$countRows[0].entry_count
+            }
+        }
+    }
+    finally {
+        Close-RimeBilingualDatabase -Database $database
+    }
+}
+
 function Get-RimeBilingualImportRows {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$InputPath)
@@ -1162,6 +1209,7 @@ Export-ModuleMember -Function @(
     'Get-RimeBilingualDefaultPaths',
     'Initialize-RimeBilingualCache',
     'Put-RimeBilingualCacheEntry',
+    'Remove-RimeBilingualModelCacheEntries',
     'Import-RimeBilingualCacheEntries',
     'Publish-RimeBilingualCacheSnapshot',
     'Validate-RimeBilingualCache'

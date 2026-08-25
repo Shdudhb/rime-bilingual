@@ -1,0 +1,10 @@
+diff --git a/WeaselServer/afxres.h b/WeaselServer/afxres.h
+new file mode 100644
+index 0000000..6d93515
+--- /dev/null
++++ b/WeaselServer/afxres.h
+@@ -0,0 +1,4 @@
++#pragma once
++
++// WeaselServer.rc only needs the standard Windows resource definitions.
++#include <winres.h>

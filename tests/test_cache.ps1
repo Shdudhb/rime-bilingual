@@ -93,6 +93,8 @@ $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) `
     ('rime-bilingual-cache-test-' + [guid]::NewGuid().ToString('N'))
 $databasePath = Join-Path $testRoot 'translations.db'
 $snapshotPath = Join-Path $testRoot 'cache_snapshot.lua'
+$purgeDatabasePath = Join-Path $testRoot 'purge-model.db'
+$purgeSnapshotPath = Join-Path $testRoot 'purge-model.lua'
 $incompatiblePath = Join-Path $testRoot 'incompatible.db'
 $importPath = Join-Path $testRoot 'entries.csv'
 $module = $null
@@ -135,6 +137,36 @@ try {
     $validated = & $cacheScript validate -DatabasePath $databasePath
     Assert-True ([bool]$validated.Valid) 'fresh cache validates'
     Assert-True ([int64]$validated.EntryCount -eq 0) 'fresh cache has no entries'
+
+    # Model-generated entries are disposable optimization data.  A targeted
+    # purge must remove only model:* provenance, preserve manual/import data,
+    # advance the revision exactly once, and publish a matching snapshot.
+    $null = & $cacheScript init -DatabasePath $purgeDatabasePath
+    $null = & $cacheScript put -DatabasePath $purgeDatabasePath `
+        -SourceText 'manual-safe' -TranslatedText 'Manual Safe' -Source 'manual-fixture'
+    $null = & $cacheScript put -DatabasePath $purgeDatabasePath `
+        -SourceText 'model-one' -TranslatedText 'Wrong One' -Source 'model:gemma-test'
+    $null = & $cacheScript put -DatabasePath $purgeDatabasePath `
+        -SourceText 'model-two' -TranslatedText 'Wrong Two' -Source 'model:other-test'
+    $purged = & $cacheScript purge-model -DatabasePath $purgeDatabasePath
+    Assert-True ([int64]$purged.DeletedCount -eq 2) 'purge-model removes all model:* rows'
+    Assert-True ([int64]$purged.Revision -eq 4) 'purge-model increments revision once after deletion'
+    Assert-True ([int64]$purged.EntryCount -eq 1) 'purge-model preserves non-model rows'
+    $purgeRows = @(Get-PrivateCacheRows -Module $module -DatabasePath $purgeDatabasePath `
+        -Sql 'SELECT source_text, source FROM translations ORDER BY source_text')
+    Assert-True ($purgeRows.Count -eq 1) 'only one non-model row remains after purge'
+    Assert-True ([string]$purgeRows[0].source_text -eq 'manual-safe' -and `
+        [string]$purgeRows[0].source -eq 'manual-fixture') 'purge-model preserves manual provenance exactly'
+    $purgedAgain = & $cacheScript purge-model -DatabasePath $purgeDatabasePath
+    Assert-True ([int64]$purgedAgain.DeletedCount -eq 0) 'repeated purge-model is idempotent'
+    Assert-True ([int64]$purgedAgain.Revision -eq 4) 'empty purge-model does not advance revision'
+    $null = & $cacheScript publish -DatabasePath $purgeDatabasePath -SnapshotPath $purgeSnapshotPath
+    $purgeValidated = & $cacheScript validate -DatabasePath $purgeDatabasePath -SnapshotPath $purgeSnapshotPath
+    Assert-True ([bool]$purgeValidated.SnapshotValid) 'snapshot published after purge-model matches the database revision'
+    $purgeSnapshotText = Read-Utf8NoBom -Path $purgeSnapshotPath
+    Assert-True ($purgeSnapshotText -match 'manual-safe') 'purged snapshot retains manual entry'
+    Assert-True ($purgeSnapshotText -notmatch 'model-one|model-two') 'purged snapshot contains no removed model entries'
+
     Assert-Throws -Action {
         & $cacheScript put -DatabasePath $databasePath -SourceText 'empty translation' -TranslatedText ''
     } -Message 'put rejects an empty translation before it can invalidate the runtime snapshot'
@@ -307,7 +339,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?)
     Assert-True ($cacheSource -notmatch '(?i)https?://|Invoke-WebRequest|Invoke-RestMethod|WebClient|System\.Net|curl|socket|openrouter|google') `
         'cache maintenance source contains no network client strings'
 
-    Write-Output 'PASS: SQLite schema, parameterized cache upsert/import, deterministic escaped snapshot, failure preservation, and incompatibility checks passed.'
+    Write-Output 'PASS: SQLite schema, targeted model-cache purge, parameterized upsert/import, deterministic snapshot, failure preservation, and incompatibility checks passed.'
 }
 finally {
     if ($null -ne $module) {

@@ -359,16 +359,21 @@ function Invoke-FilterModel {
 }
 
 $filterPath = Join-Path $ProjectRoot 'lua\rime_bilingual.lua'
+$asyncPath = Join-Path $ProjectRoot 'lua\rime_bilingual_async.lua'
 $dictionaryPath = Join-Path $ProjectRoot 'lua\rime_bilingual_dictionary.lua'
 $cachePath = Join-Path $ProjectRoot 'lua\rime_bilingual_cache.lua'
 $patchPath = Join-Path $ProjectRoot 'rime_ice.custom.yaml'
 
 Assert-True (Test-Path -LiteralPath $filterPath -PathType Leaf) 'filter module exists'
+Assert-True (Test-Path -LiteralPath $asyncPath -PathType Leaf) 'async processor/bridge wrapper exists'
 Assert-True (Test-Path -LiteralPath $dictionaryPath -PathType Leaf) 'dictionary module exists'
 Assert-True (Test-Path -LiteralPath $cachePath -PathType Leaf) 'cache loader module exists'
 Assert-True (Test-Path -LiteralPath $patchPath -PathType Leaf) 'schema patch exists'
 
 $filter = Read-Utf8File -Path $filterPath
+$filterCode = $filter -replace '(?m)--.*$', ''
+$asyncSource = Read-Utf8File -Path $asyncPath
+$asyncCode = $asyncSource -replace '(?m)--.*$', ''
 $dictionarySource = Read-Utf8File -Path $dictionaryPath
 $cacheSource = Read-Utf8File -Path $cachePath
 $schemaPatch = Read-Utf8File -Path $patchPath
@@ -377,18 +382,73 @@ $schemaPatch = Read-Utf8File -Path $patchPath
 # they are not a substitute for loading the modules in librime-lua.
 Assert-True (([regex]::Matches($filter, 'require\("rime_bilingual_dictionary"\)')).Count -eq 1) 'filter loads the local dictionary exactly once'
 Assert-True (([regex]::Matches($filter, 'require\("rime_bilingual_cache"\)')).Count -eq 1) 'filter loads the cache loader exactly once'
+Assert-True (([regex]::Matches($filter, 'require\("rime_bilingual_async"\)')).Count -eq 1) 'filter loads only the bounded native bridge wrapper for async work'
+Assert-True (([regex]::Matches($filter, '\brequire\s*\(')).Count -eq 3) 'filter imports only dictionary, snapshot loader, and the async wrapper'
 Assert-True ($filter -match 'for\s+candidate\s+in\s+input:iter\(\)\s+do') 'filter iterates the incoming candidate stream'
 Assert-True ($filter -match 'bilingual_dictionary\[candidate\.text\]') 'filter uses exact candidate text dictionary lookup'
 Assert-True ($filter -match 'bilingual_cache\[candidate\.text\]') 'filter uses exact candidate text cache lookup'
 Assert-True ($filter -match 'rime_api:get_user_data_dir\(\)') 'filter locates the cache under the Rime user data directory'
+Assert-True ($filter -match 'cache_loader\.is_vertical_layout\(user_data_dir, warn\)') 'filter gates bilingual annotations on the compiled Weasel vertical layout'
+Assert-True ($filter -match 'env\.bilingual_enabled\s*=\s*requested_enabled and env\.bilingual_vertical_layout') 'horizontal Weasel layout disables dictionary, cache, and AI annotations'
+Assert-True ($filter -match 'enabled\s*=\s*env\.bilingual_enabled') 'filter passes the vertical-only gate into the async component'
 Assert-True ($filter -match 'candidate:get_genuine\(\)\.comment\s*=') 'filter changes only the genuine candidate comment'
 Assert-True ($filter -match 'yield\(candidate\)') 'filter yields the original candidate'
 Assert-True ($filter -match 'if\s+translation\s*==\s*nil\s+then') 'filter checks cache only after a dictionary miss'
 Assert-True ($filter -match 'if\s+translation\s*~=\s*nil\s+then') 'filter annotates dictionary or cache hits'
 Assert-True ($filter -match 'preserve_existing_comment') 'filter supports existing comment preservation'
-Assert-True ($filter -notmatch '(?i)https?://|curl|socket|openrouter|google') 'typing path contains no network access'
-Assert-True ($filter -notmatch '(?i)\bloadfile\b|\bSQLite\b|\bhttp\b|\bsocket\b|\bprocess\b') 'candidate filter does not load files or invoke external services'
+Assert-True ($filter -notmatch '(?i)https?://|curl|socket|openrouter|google') 'filter contains no network client'
+Assert-True ($filter -notmatch '(?i)\bloadfile\b|\bdofile\b|\bSQLite\b|\bhttp\b|\bsocket\b|\bprocess\b|\bio\s*\.|\bos\s*\.|\bpackage\s*\.') 'candidate filter does not perform file, database, process, or network I/O'
+Assert-True ($filter -notmatch '(?i)\bllama(?:-server)?\b|\bgguf\b|/translate\b|chat/completions|translate-batch|model\.ps1') 'candidate filter has no direct dependency on runtime, model, or HTTP batch API'
 Assert-True ($filter -notmatch '(?m)^\s*candidate\.(text|type|quality|start_pos|end_pos)\s*=') 'filter does not rewrite candidate identity fields'
+
+# V0.3 loads the pinned DLL only during init. Callback functions perform only
+# bounded table/string work and pcall into native try_* methods; the worker owns
+# UIA/HTTP and Helper owns SQLite/model access.
+Assert-True (([regex]::Matches($asyncSource, 'package\.loadlib')).Count -eq 1) 'native bridge is loaded exactly once from init code'
+Assert-True ($asyncSource -match 'rime_api:get_user_data_dir\(\)') 'absolute bridge path starts from the Rime user data directory'
+Assert-True ($asyncSource -match '/rime-bilingual/native/rime_bilingual_bridge\.dll') 'absolute bridge path uses the managed native payload directory'
+Assert-True ($asyncSource -match 'luaopen_rime_bilingual_bridge') 'bridge entrypoint is explicit'
+Assert-True ($asyncSource -match 'pcall\(\s*package\.loadlib') 'missing or corrupt bridge is isolated with pcall'
+Assert-True ($asyncSource -match 'pcall\(bridge\.configure') 'bridge configuration failure is isolated with pcall'
+Assert-True ($asyncSource -match 'pcall\(state\.bridge\[method\], value\)') 'all callback bridge calls are isolated with pcall'
+Assert-True ($asyncSource -notmatch '(?i)\bio\s*\.|\bos\s*\.|\bloadfile\b|\bdofile\b|\bsqlite\b|\bsocket\b|\bcurl\b|\bcreateprocess\b') 'Lua async path has no file/database/network/process implementation'
+Assert-True ($asyncSource -notmatch 'synthetic|set_timeout|timer') 'Lua never injects a key or uses timer-driven refresh'
+Assert-True ($asyncSource -notmatch 'refresh_non_confirmed_composition\(') 'Lua never initiates composition refresh; the patched Weasel main thread owns ready wakeup'
+Assert-True ($asyncSource -notmatch 'refresh_generation|refresh_fingerprint|refresh_ready_page_once') 'Lua no longer maintains a key-driven refresh marker'
+Assert-True ($asyncSource -match 'local translations = poll\(state, page\)') 'a native-triggered filter rebuild polls ready before page comments are finalized'
+Assert-True ($asyncCode -notmatch 'menu:prepare\(') 'async callbacks never force Menu preparation'
+Assert-True ($filterCode -notmatch 'segment\.menu|menu:prepare\(') 'candidate filter never re-enters the Menu currently evaluating that filter'
+Assert-True ($asyncSource -match 'update_notifier' -and $asyncSource -match 'menu:candidate_count\(\)' -and $asyncSource -match 'menu:get_candidate_at\(absolute_index\)') 'page-change notifier reads only already materialized Menu candidates'
+Assert-True ($asyncSource -match 'state\.composition_input ~= input') 'page-change notifier ignores input edits handled by the normal filter pass'
+Assert-True ($asyncSource -match 'state\.page\.page_start == page_start') 'same-page highlight updates poll the saved page instead of replacing it'
+Assert-True ($asyncSource -match 'if options\.enabled == false then' -and $asyncSource -match 'state\.enabled = false') 'horizontal layout disables async work during filter init'
+Assert-True ($filter -match 'local buffered = \{\}') 'filter tracks one bounded upstream candidate page while yielding normally'
+Assert-True ($filter -match 'target_page_start = math\.floor\(selected_index / page_size\) \* page_size') 'filter targets only the page containing the current selected_index'
+Assert-True ($filter -match 'absolute_index >= target_page_start' -and $filter -match 'absolute_index < target_page_start \+ page_size') 'filter ignores prefetched candidates outside the selected visible page'
+Assert-True ($filter -match 'local submitted = false' -and $filter -match 'if submitted or #buffered == 0') 'one filter invocation submits at most one visible-page batch'
+Assert-True ($asyncSource -match 'dictionary\[candidate\.text\] == nil and cache\[candidate\.text\] == nil') 'only dictionary/snapshot misses enter the AI batch'
+Assert-True ($filter -match 'async\.finish_filter\(env, page, misses\)') 'the selected visible page uses one bounded async submission'
+Assert-True ($asyncSource -match 'result\.generation ~= state\.expected_generation') 'ready generation must equal the submitted pair'
+Assert-True ($asyncSource -match 'result\.fingerprint ~= state\.expected_fingerprint') 'ready fingerprint must equal the submitted pair'
+Assert-True ($asyncSource -match 'function M\.func\(key_event, env\)') 'processor receives the real key event through its standard func callback'
+Assert-True ($asyncSource -match 'representation == "BackSpace"') 'processor has an explicit latency guard for Backspace'
+Assert-True ($asyncSource -match 'state\.skip_next_filter = true') 'Backspace marks the next async filter pass for skipping'
+Assert-True ($asyncSource -match 'if state\.skip_next_filter then') 'filter honors the Backspace skip without materializing the active page'
+Assert-True ($asyncSource -match 'local translations = poll\(state, state\.page\)') 'processor performs a bounded poll for every key including PageUp'
+Assert-True ($asyncSource -match 'apply_ready\(state, state\.page, translations\)') 'processor applies a ready result without requiring the filter to run again'
+Assert-True ($asyncSource -match 'genuine = candidate:get_genuine\(\)') 'filter saves genuine candidate references for current page misses'
+Assert-True ($asyncSource -match 'entry\.genuine\.comment = comment') 'processor changes only the saved genuine candidate comment'
+Assert-True ($asyncSource -match 'genuine\.text == identity\.text') 'processor revalidates genuine candidate text before changing comment'
+Assert-True ($asyncSource -match 'genuine\.type == identity\.type') 'processor revalidates genuine candidate type before changing comment'
+Assert-True ($asyncSource -match 'genuine\.start == identity\.start') 'processor revalidates genuine candidate start before changing comment'
+Assert-True ($asyncSource -match 'genuine\._end == identity\["end"\]') 'processor revalidates genuine candidate end before changing comment'
+Assert-True ($asyncSource -match 'state\.refs = \{\}') 'composition/page generation changes clear saved candidate references'
+Assert-True ($asyncSource -match 'function M\.fini\(env\)') 'async component exposes lifecycle cleanup'
+Assert-True ($asyncSource -match 'state\.update_connection:disconnect\(\)') 'async component disconnects the page-change notifier during fini'
+Assert-True ($filter -match 'function M\.fini\(env\)\s+async\.fini\(env\)') 'filter lifecycle also releases shared async state'
+Assert-True ($asyncSource -match 'states\[env\.engine\] = nil') 'fini removes the engine entry from the weak state table'
+Assert-True ($asyncSource -match 'composition == nil or composition:empty\(\)') 'processor checks for commit/cancel-cleared composition before polling stale refs'
+Assert-True ($asyncSource -match 'return 2') 'processor always returns kNoop and preserves key handling'
 
 Assert-True ($cacheSource -notmatch '(?m)\bload(file|string)?\s*\(') 'cache loader never executes snapshot text as Lua code'
 Assert-True ($cacheSource -match 'io\.open') 'cache loader reads the snapshot only during initialization'
@@ -404,13 +464,23 @@ Assert-True ($cacheSource -match 'source_text\s*<\s*previous_source') 'cache loa
 Assert-True ($cacheSource -match 'MAX_ENTRIES\s*=\s*\d+') 'cache loader bounds entry count'
 Assert-True ($cacheSource -match 'MAX_STRING_BYTES\s*=\s*\d+') 'cache loader bounds string size'
 Assert-True ($cacheSource -match 'MAX_FILE_BYTES\s*=\s*\d+') 'cache loader bounds snapshot file size before reading it'
+Assert-True ($cacheSource -match 'MAX_LAYOUT_FILE_BYTES\s*=\s*\d+') 'layout gate bounds the compiled Weasel config before reading it'
 Assert-True ($cacheSource -match 'file\.read,\s*file,\s*MAX_FILE_BYTES\s*\+\s*1') 'cache loader uses a bounded read even if the file grows after seek'
+Assert-True ($cacheSource -match '/build/weasel\.yaml') 'layout gate reads only the compiled Weasel config during init'
+Assert-True ($cacheSource -match 'layout_type == "vertical"') 'modern Weasel vertical layout enables bilingual annotations'
+Assert-True ($cacheSource -match 'horizontal == false') 'legacy Weasel horizontal=false also counts as a vertical candidate list'
+Assert-True ($cacheSource -match 'translation disabled: Weasel candidate layout is not vertical') 'unknown or horizontal layout fails closed with translations disabled'
 Assert-True ($cacheSource -notmatch 'file\.read,\s*file,\s*"\*a"') 'cache loader never performs an unbounded read-all operation'
 Assert-True ($cacheSource -match 'return \{\}') 'cache loader falls back to an empty cache'
 
 Assert-True ($schemaPatch -match '"engine/filters/@before last"\s*:\s*lua_filter@\*rime_bilingual') 'schema patch inserts before the final uniquifier'
 Assert-True ($schemaPatch -match 'lua_filter@\*rime_bilingual') 'schema patch registers the filter'
+Assert-True ($schemaPatch -match '"engine/processors/@before 0"\s*:\s*lua_processor@\*rime_bilingual_async') 'schema patch registers the non-consuming async processor'
 Assert-True ($schemaPatch -match 'cache_enabled:\s*true') 'schema patch enables the V0.2 cache by default'
+Assert-True ($schemaPatch -match 'async_enabled:\s*true') 'schema patch enables V0.3 async requests by default'
+Assert-True ($schemaPatch -match 'helper_endpoint:\s*"http://127\.0\.0\.1:18081"') 'schema config pins a numeric loopback Helper endpoint'
+Assert-True ($schemaPatch -match 'request_timeout_ms:\s*3000') 'schema config sets a bounded worker request timeout'
+Assert-True ($schemaPatch -match 'expected_rime_sha256:\s*"[0-9A-Fa-f]{64}"') 'schema config pins the supported Rime ABI hash'
 
 $defaultSeparator = ' ' + (New-UnicodeString -CodePoints @(0x00B7)) + ' '
 Assert-True ($schemaPatch -match ('comment_separator:\s*"' + [regex]::Escape($defaultSeparator) + '"')) 'schema patch keeps the configured comment separator'
@@ -621,6 +691,222 @@ $disabledResult = @(Invoke-FilterModel `
     -Separator $defaultSeparator)
 Assert-True ([object]::ReferenceEquals($disabledResult[0], $disabledCandidate)) 'disabled mode yields the same candidate object'
 Assert-True ($disabledCandidate.comment -eq 'disabled-comment') 'disabled mode leaves the candidate comment unchanged'
+
+# V0.2-ai is deliberately outside the Rime process.  An absent helper/model is
+# therefore equivalent to having no locally available translation: the filter
+# must yield the untouched candidate immediately, without an AI fallback.
+$aiUnavailableCandidate = New-ModelCandidate -Text 'ai-unavailable' -Comment 'native-only' -Type 'phrase' -Quality 6.5 -Start 3 -End 8
+$aiUnavailableResult = @(Invoke-FilterModel `
+    -Candidates @($aiUnavailableCandidate) `
+    -Dictionary @{} `
+    -Cache @{} `
+    -Enabled $true `
+    -PreserveExistingComment $true `
+    -Prefix '' `
+    -Separator $defaultSeparator)
+Assert-True ($aiUnavailableResult.Count -eq 1 -and [object]::ReferenceEquals($aiUnavailableResult[0], $aiUnavailableCandidate)) 'missing dictionary/cache/helper/model still yields the original candidate identity'
+Assert-True ($aiUnavailableCandidate.text -eq 'ai-unavailable' -and $aiUnavailableCandidate.comment -eq 'native-only') 'missing helper/model leaves candidate text and native comment unchanged'
+Assert-True ($aiUnavailableCandidate.type -eq 'phrase' -and $aiUnavailableCandidate.quality -eq 6.5 -and $aiUnavailableCandidate.start -eq 3 -and $aiUnavailableCandidate.end -eq 8) 'missing helper/model preserves candidate type, quality, and range'
+
+# Model the V0.3 pair gate independently of native timing. These checks cover
+# the observable Lua policy while static assertions above bind that policy to
+# the production implementation and bridge calls.
+function Get-AsyncFingerprintModel {
+    param([int]$PageStart, [object[]]$Candidates)
+    $builder = New-Object Text.StringBuilder
+    $null = $builder.Append("RBIL-PAGE-V1`0")
+    $null = $builder.Append("$PageStart|")
+    foreach ($candidate in $Candidates) {
+        foreach ($value in @($candidate.absolute_index, $candidate.text, $candidate.type, $candidate.start, $candidate.end)) {
+            $rendered = [string]$value
+            $null = $builder.Append(([Text.Encoding]::UTF8.GetByteCount($rendered))).Append(':').Append($rendered).Append('|')
+        }
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($builder.ToString())
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+function New-AsyncStateModel {
+    return [pscustomobject]@{
+        Generation = 0L
+        Signature = $null
+        ExpectedGeneration = $null
+        ExpectedFingerprint = $null
+        Active = @{}
+        SubmitCount = 0
+        PollCount = 0
+    }
+}
+
+function Update-AsyncPageModel {
+    param([object]$State, [string]$InputText, [int]$PageStart, [object[]]$Candidates)
+    $fingerprint = Get-AsyncFingerprintModel -PageStart $PageStart -Candidates $Candidates
+    $signature = "$($InputText.Length):$InputText|$PageStart|$fingerprint"
+    if ($signature -cne $State.Signature) {
+        $State.Generation++
+        $State.Signature = $signature
+        $State.ExpectedGeneration = $null
+        $State.ExpectedFingerprint = $null
+    }
+    return [pscustomobject]@{
+        generation = $State.Generation
+        page_start = $PageStart
+        candidates = $Candidates
+        fingerprint = $fingerprint
+    }
+}
+
+function Submit-AsyncPageModel {
+    param([object]$State, [object]$Page, [object[]]$Misses)
+    if ($Misses.Count -eq 0) { return 'no_submit' }
+    $pair = "$($Page.generation):$($Page.fingerprint)"
+    $State.ExpectedGeneration = $Page.generation
+    $State.ExpectedFingerprint = $Page.fingerprint
+    if ($State.Active.ContainsKey($pair)) { return 'duplicate' }
+    $State.Active[$pair] = $true
+    $State.SubmitCount++
+    return 'accepted'
+}
+
+function Poll-AsyncPageModel {
+    param([object]$State, [object]$Page, [object]$Completion)
+    $State.PollCount++
+    if ($null -eq $Completion) { return $null }
+    if ($Completion.generation -ne $State.ExpectedGeneration -or
+        $Completion.fingerprint -cne $State.ExpectedFingerprint -or
+        $Completion.generation -ne $Page.generation -or
+        $Completion.fingerprint -cne $Page.fingerprint) {
+        return $null
+    }
+    return $Completion.translations
+}
+
+function New-AsyncCandidateModel {
+    param([int]$Index, [string]$Text, [string]$Type = 'phrase', [int]$Start = 0, [int]$End = 5)
+    return [pscustomobject]@{ absolute_index = $Index; text = $Text; type = $Type; start = $Start; end = $End }
+}
+
+$asyncState = New-AsyncStateModel
+$localOnlyPage = Update-AsyncPageModel -State $asyncState -InputText 'jin' -PageStart 0 -Candidates @(
+    (New-AsyncCandidateModel -Index 0 -Text $today),
+    (New-AsyncCandidateModel -Index 1 -Text $schoolTraditional)
+)
+$localOnlyMisses = @($localOnlyPage.candidates | Where-Object { -not $entries.ContainsKey($_.text) -and -not $cacheModel.Cache.ContainsKey($_.text) })
+Assert-True ((Submit-AsyncPageModel -State $asyncState -Page $localOnlyPage -Misses $localOnlyMisses) -eq 'no_submit') 'dictionary/snapshot-only page produces zero native submissions'
+Assert-True ($asyncState.SubmitCount -eq 0) 'cache hits never call Helper through the bridge'
+
+$missOne = 'async-miss-one'
+$missTwo = 'async-miss-two'
+$mixedPage = Update-AsyncPageModel -State $asyncState -InputText 'async' -PageStart 0 -Candidates @(
+    (New-AsyncCandidateModel -Index 0 -Text $today),
+    (New-AsyncCandidateModel -Index 1 -Text $missOne),
+    (New-AsyncCandidateModel -Index 2 -Text $cacheOnly),
+    (New-AsyncCandidateModel -Index 3 -Text $missTwo)
+)
+$mixedMisses = @()
+for ($slot = 0; $slot -lt $mixedPage.candidates.Count; $slot++) {
+    $text = $mixedPage.candidates[$slot].text
+    if (-not $entries.ContainsKey($text) -and -not $cacheModel.Cache.ContainsKey($text)) {
+        $mixedMisses += [pscustomobject]@{ slot = $slot; text = $text }
+    }
+}
+Assert-True ($mixedMisses.Count -eq 2 -and $mixedMisses[0].slot -eq 1 -and $mixedMisses[1].slot -eq 3) 'one page request contains only ordered dictionary/snapshot misses with original slots'
+Assert-True ((Submit-AsyncPageModel -State $asyncState -Page $mixedPage -Misses $mixedMisses) -eq 'accepted') 'one page miss batch is accepted once'
+Assert-True ((Submit-AsyncPageModel -State $asyncState -Page $mixedPage -Misses $mixedMisses) -eq 'duplicate') 'same page pair is deduplicated'
+Assert-True ($asyncState.SubmitCount -eq 1) 'duplicate callback does not create another batch'
+
+$ready = [pscustomobject]@{
+    generation = $mixedPage.generation
+    fingerprint = $mixedPage.fingerprint
+    translations = @{ 1 = 'First'; 3 = 'Second' }
+}
+Assert-True ($null -ne (Poll-AsyncPageModel -State $asyncState -Page $mixedPage -Completion $ready)) 'matching generation/fingerprint result becomes visible on a natural callback'
+
+# A completed request may be observed only by the processor: the filter does
+# not necessarily run again for selection movement. Model the saved genuine
+# reference path and prove that one processor callback applies it idempotently.
+$processorOnlyCandidate = New-ModelCandidate -Text $missOne -Comment 'native-comment' -Type 'phrase' -Start 0 -End 5
+$savedRef = [pscustomobject]@{
+    Genuine = $processorOnlyCandidate
+    BaseComment = 'native-comment'
+    AppliedComment = $null
+}
+$filterRerunCount = 0
+$processorTranslation = 'Async English'
+$processorComment = $savedRef.BaseComment + $defaultSeparator + $processorTranslation
+if ($savedRef.AppliedComment -ne $processorComment -or $savedRef.Genuine.comment -ne $processorComment) {
+    $savedRef.Genuine.comment = $processorComment
+    $savedRef.AppliedComment = $processorComment
+}
+Assert-True ($filterRerunCount -eq 0 -and $processorOnlyCandidate.comment -eq $processorComment) 'ready result plus only a processor callback updates the saved genuine comment'
+$commentAfterFirstProcessorPoll = $processorOnlyCandidate.comment
+if ($savedRef.AppliedComment -ne $processorComment -or $savedRef.Genuine.comment -ne $processorComment) {
+    $savedRef.Genuine.comment = $processorComment
+    $savedRef.AppliedComment = $processorComment
+}
+Assert-True ($processorOnlyCandidate.comment -eq $commentAfterFirstProcessorPoll) 'repeated processor polls do not append the same translation twice'
+
+$identityChangedCandidate = New-ModelCandidate -Text 'replaced-candidate' -Comment 'replacement-native' -Type 'phrase' -Start 0 -End 5
+$immutableIdentity = [pscustomobject]@{ text = $missOne; type = 'phrase'; start = 0; end = 5 }
+$identityStillMatches = $identityChangedCandidate.text -ceq $immutableIdentity.text -and
+    $identityChangedCandidate.type -ceq $immutableIdentity.type -and
+    $identityChangedCandidate.start -eq $immutableIdentity.start -and
+    $identityChangedCandidate.end -eq $immutableIdentity.end
+if ($identityStillMatches) { $identityChangedCandidate.comment = 'must-not-apply' }
+Assert-True ($identityChangedCandidate.comment -eq 'replacement-native') 'processor refuses a saved reference whose live genuine identity changed'
+
+$commitCancelState = [pscustomobject]@{
+    Page = $mixedPage
+    ExpectedGeneration = $mixedPage.generation
+    ExpectedFingerprint = $mixedPage.fingerprint
+    Refs = @{ 1 = $savedRef }
+}
+$compositionEmptyBeforeNextKey = $true
+if ($compositionEmptyBeforeNextKey) {
+    $commitCancelState.Page = $null
+    $commitCancelState.ExpectedGeneration = $null
+    $commitCancelState.ExpectedFingerprint = $null
+    $commitCancelState.Refs = @{}
+}
+Assert-True ($null -eq $commitCancelState.Page -and $commitCancelState.Refs.Count -eq 0) 'next processor callback after commit/cancel clears stale page references before poll'
+
+$finiStateTable = @{ engine = [pscustomobject]@{ Refs = @{ 1 = $savedRef }; Page = $mixedPage } }
+$finiStateTable.Remove('engine')
+Assert-True ($finiStateTable.Count -eq 0) 'component fini removes its engine-scoped shared state'
+
+$changedPage = Update-AsyncPageModel -State $asyncState -InputText 'asyncx' -PageStart 0 -Candidates $mixedPage.candidates
+Assert-True ($changedPage.generation -gt $mixedPage.generation) 'composition input change increments generation even if candidates are unchanged'
+Assert-True ($null -eq (Poll-AsyncPageModel -State $asyncState -Page $changedPage -Completion $ready)) 'old generation completion is discarded after rapid input'
+
+$pageTwoCandidates = @(
+    (New-AsyncCandidateModel -Index 5 -Text 'page-two-a'),
+    (New-AsyncCandidateModel -Index 6 -Text 'page-two-b')
+)
+$pageTwo = Update-AsyncPageModel -State $asyncState -InputText 'asyncx' -PageStart 5 -Candidates $pageTwoCandidates
+Assert-True ($pageTwo.generation -gt $changedPage.generation) 'PageUp/PageDown page_start change increments generation'
+$pollsBeforePageKey = $asyncState.PollCount
+$null = Poll-AsyncPageModel -State $asyncState -Page $pageTwo -Completion $ready
+Assert-True ($asyncState.PollCount -eq ($pollsBeforePageKey + 1)) 'PageUp/PageDown processor path performs a poll without consuming the key'
+Assert-True ($null -eq (Poll-AsyncPageModel -State $asyncState -Page $pageTwo -Completion $ready)) 'old page fingerprint cannot annotate the new page'
+
+$rapidState = New-AsyncStateModel
+$previousGeneration = 0L
+for ($rapidIndex = 0; $rapidIndex -lt 100; $rapidIndex++) {
+    $rapidCandidate = New-AsyncCandidateModel -Index 0 -Text ("rapid-$rapidIndex")
+    $rapidPage = Update-AsyncPageModel -State $rapidState -InputText ("p$rapidIndex") -PageStart 0 -Candidates @($rapidCandidate)
+    Assert-True ($rapidPage.generation -gt $previousGeneration) "rapid input generation is monotonic at step $rapidIndex"
+    $previousGeneration = $rapidPage.generation
+}
+
+$missingDllState = [pscustomobject]@{ Enabled = $true; WarningCount = 0 }
+try { throw [DllNotFoundException]::new('simulated managed bridge absence') }
+catch { $missingDllState.Enabled = $false; $missingDllState.WarningCount++ }
+Assert-True (-not $missingDllState.Enabled -and $missingDllState.WarningCount -eq 1) 'missing DLL disables async fail-soft with one diagnostic'
+$fallbackCandidate = New-ModelCandidate -Text $today -Comment $null
+$fallbackYield = @(Invoke-FilterModel -Candidates @($fallbackCandidate) -Dictionary $entries -Cache @{})
+Assert-True ([object]::ReferenceEquals($fallbackYield[0], $fallbackCandidate) -and $fallbackCandidate.comment -eq 'Today') 'missing bridge preserves dictionary annotation and original candidate identity'
 
 Write-Output "STATIC/MODEL checks passed ($($entries.Count) dictionary entries); UTF-8 payload, cache validation, and candidate behavior model passed."
 Write-Output 'PRODUCTION RUNTIME checks: not executed; a Weasel/librime-lua host is required for genuine init/func execution.'

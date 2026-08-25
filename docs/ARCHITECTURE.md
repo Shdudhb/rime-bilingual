@@ -1,177 +1,329 @@
-# V0.2 架構
+# V0.3 打字時非阻塞請求架構契約
 
-## 範圍與不變條件
+## V0.3 交付邊界
 
-V0.2 在 V0.1 的內建 Lua 詞典後加入 SQLite 本機 cache。它仍只使用 Rime Lua 與 Weasel 原生 comment UI，不包含外部翻譯 API、背景 Helper、英文上屏快捷鍵，也不修改 Weasel 原始碼。
-
-設計維持以下不變條件：
-
-- 候選文字、順序、分頁與選取身份由原 schema 決定。
-- Space、數字鍵、方向鍵及 PageUp/PageDown 行為不變。
-- 打字熱路徑不開 SQLite、不做檔案 I/O、不啟動程序，也不連網。
-- cache 缺失、停用或無效時，內建詞典與原候選仍可正常工作。
-- V0.2 不會把 composition、候選或密碼欄內容送出本機。
-
-## 讀寫分離架構
+V0.3 在既有 V0.2-ai Helper 與模型資料流前加入一個 x64 原生 Lua bridge，讓候選頁在打字時自動送出翻譯請求。完整資料流是：
 
 ```text
-管理端（不在打字熱路徑）
-scripts/cache.ps1
-  -> init / put / import
-  -> SQLite translations.db（可寫入的持久資料）
-  -> publish
-  -> canonical cache_snapshot.lua（原子發布、唯讀執行投影）
-
-Rime schema 初始化
-  -> 載入內建 Lua 詞典
-  -> 驗證並載入 cache_snapshot.lua 一次
-  -> 建立兩個記憶體 table
-
-每個候選
-  -> dictionary[candidate.text]
-  -> 僅在 miss 時查 snapshot_cache[candidate.text]
-  -> 命中時只改 genuine candidate.comment
-  -> yield 原 candidate
+Rime Lua filter / processor
+  -> dictionary + canonical snapshot（只讀記憶體，永遠優先）
+  -> miss page -> native bridge 的 bounded try_submit
+  -> native worker thread -> UIA password check -> loopback HTTP
+  -> Helper v2 -> SQLite cache -> miss 才呼叫 llama-server
+  -> native completion ring
+  -> 下一次真實按鍵或自然 callback -> try_poll -> 核對保存的 genuine refs -> comment
 ```
 
-SQLite 是 cache 的持久、可編輯資料來源；canonical snapshot 是固定格式、確定性排序的 Rime 執行期投影。Rime 刻意不直接連 SQLite，避免資料庫鎖、原生呼叫或磁碟延遲進入輸入法程序。
+V0.3 不傳送 recent context（固定 `context: ""`），不實作英文上屏快捷鍵，也不管理 V0.6 的模型載入／600 秒 idle unload。SQLite cache、非同步 request、timeout、dedup、generation + SHA-256 fingerprint stale rejection 和打字熱路徑零等待屬本版。
 
-snapshot 只在 filter `init` 時讀取。`put`、`import` 或 `publish` 不會改變已建立的 filter 環境；發布後必須重新部署，新的 schema 環境才會載入新版 snapshot。
+## 不可妥協的執行緒邊界
 
-## 元件
+- Rime/Lua 主執行緒只可執行既有 dictionary/snapshot 記憶體查詢，以及 bridge 的 bounded `try_submit`、`try_poll`、`status`。不得在 callback 中開檔、開 SQLite、DNS、HTTP、UI Automation、啟動程序或等待 mutex/event/thread。
+- bridge 呼叫只可複製有上限的資料並操作 lock-free ring 或 non-waiting try-lock；ring 忙碌或已滿時立即回傳狀態並略過英文，中文候選照常 yield。
+- 原生 worker 是唯一可執行 UIA、loopback HTTP、timeout 與 response parsing 的執行緒。Helper 是唯一可讀寫 SQLite 或等待 llama-server 的程序。
+- filter 保存目前頁最多 20 個 `candidate:get_genuine()` reference 與其 immutable identity/local-hit flag；filter 與 processor 都只能修改這些 genuine candidate 的 `comment`，不得改 text、type、quality、range、順序、分頁或選取身份。processor 對每個按鍵（包含 PageUp/PageDown）做 bounded poll，ready 時再次核對 pair 與 reference identity、套用 comment，最後一律回傳 `kNoop`，不攔截原有按鍵。
 
-| 檔案 | 責任 |
+## 元件與載入
+
+bridge 安裝到 `%APPDATA%\Rime\rime-bilingual\native\rime_bilingual_bridge.dll`。Lua 以 `rime_api:get_user_data_dir()` 組出此**絕對路徑**，並且只用：
+
+```lua
+package.loadlib(absolute_path, "luaopen_rime_bilingual_bridge")
+```
+
+不得把 native 目錄加入全域 `package.cpath`，也不得從目前工作目錄或 PATH 搜尋 DLL。DLL 與 Weasel/Rime 必須同為 x64；安裝 manifest 必須 pin 已驗證的 `rime.dll` SHA-256 與 bridge SHA-256。安裝/升級時 architecture 或 hash 不符就不得發布 payload；runtime `configure` 再核對目前已載入的 `rime.dll` identity，失配就將 AI bridge 設為 disabled，記錄不含候選內容的單一診斷，繼續純中文/dictionary/snapshot 路徑。這是明確 ABI pin；不宣稱跨任意 librime/Lua build 相容。
+
+bridge 的逐函式契約、fingerprint framing、limits 與 Helper v2 wire format 以 [ASYNC_PROTOCOL.md](ASYNC_PROTOCOL.md) 為準。
+
+## Rime callback 流程
+
+0. `rime_bilingual.init` 只在初始化時讀取 `build/weasel.yaml`。只有編譯後的 Weasel candidate layout 明確為 `style/layout/type: vertical`，或舊式 `style/horizontal: false` 時才啟用 bilingual；橫列、未知或讀取失敗都 fail closed，dictionary/cache/AI 註解與 async page tracking 一併停用。typing callback 不讀 Weasel config。
+1. filter 逐候選先查 dictionary，再查 schema init 時載入的 canonical snapshot。命中立即使用並標記 `local_hit=true`；只有兩者皆 miss 的 slot 可進 AI batch。
+2. filter 先從 composition 的 `selected_index` 與 schema `page_size` 算出目前可視頁的 `page_start`，再依 upstream `input:iter()` 的 lazy contract 逐候選處理並 yield。只有 absolute index 落在該可視頁範圍內的候選會被保存，最多 `page_size`（上限 20）個 refs/identity；Rime 為 uniquifier 或後續頁面預取的候選不得建立新的 AI batch。取得該可視頁最後一個 candidate 時，先對完整頁 misses 呼叫一次 `try_submit`，再 yield 該最後一個 candidate；最後不足一頁時只在 iterator 已確認 exhausted 後 submit。保存 `{slot, genuine_ref, immutable_identity, local_hit}` 的集合只代表一個確切 `(generation, fingerprint)`；不得逐候選 inference、不得為了湊頁而連續 consume upstream 卻不 yield，也不得從 filter 反向呼叫 `segment.menu:prepare()`。
+3. bridge worker 將 terminal `ready` completion 成功放入 bounded completion ring 後，只做一次 non-blocking `PostMessageW` 到 Weasel 0.17.4 IPC server 的 hidden message-loop window。worker **不得**呼叫任何 Rime API、不得等待 UI thread，也不得送 synthetic key。patched Weasel 在自己的主執行緒收到 private `WM_APP` message 後，只對目前 active 且仍 `is_composing` 的 session toggle schema-local `_rime_bilingual_refresh` option；librime 的 option update 會在同一主執行緒呼叫 `RefreshNonConfirmedComposition()`，不提交文字、不改 input，也不等待 Helper/model。
+4. native wakeup 造成 filter 重新執行；`prepare_filter()` 在該輪 page materialization 時先 `try_poll`，只有 generation/fingerprint 完全匹配的 ready result 才可在 candidate `yield` **之前**寫入 comment。PageUp/PageDown 或頁內 highlight 完成後，`Context.update_notifier` 仍只觀察已更新的 `selected_index`；若 input 未改變而 page_start 改變，callback 只以 `candidate_count()` / `get_candidate_at()` 讀取 librime 已 materialize 的目的頁，建立新 generation 並 submit，**不得**呼叫 `menu:prepare()`。input 編輯仍由正常 filter path 處理，不由 notifier 重複 batching。generation、composition、page 或 identity 一改變，必須在建立新集合前清除舊 refs。component fini 斷開 notifier 並清除 state；本版沒有 commit/cancel notifier，因此 commit/cancel 後由下一個真實鍵事件的 processor 在 poll **之前**偵測 composition 為空並清除，不得先 poll 舊 pair。不得在不同頁或不同 generation 保留/使用 ref。
+5. 舊 generation、不同頁、不同順序、不同 candidate identity、local hit 或數量不符一律丟棄；AI 永遠不得覆寫 dictionary/snapshot comment。
+6. 不得送 synthetic key、不得用 timer polling/刷新、不得讓 bridge worker 直接呼叫 Rime API。只有 terminal `ready` completion publication 才可 `PostMessage` 喚醒 Weasel；pending/failed/stale/expired completion 不得觸發 UI refresh。Weasel handler 必須在主執行緒重新確認 active composing session 後才 toggle `_rime_bilingual_refresh`，其餘狀態一律忽略。
+
+因此 AI 完成後即使使用者完全停住不按鍵，也會由 native completion message 喚醒 Weasel/Rime，filter 自動重跑並補上英文；**不需要 timer、synthetic key 或下一個真實鍵盤事件。** Helper/bridge/Weasel 任一環節失敗時只缺英文，中文候選與選字不得受影響。
+
+頁面計算使用 Rime 的零起始 `selected_index` 與 schema `page_size`：`page_start = floor(selected_index / page_size) * page_size`。初次/輸入變更時，filter 的 `absolute_index` 只用來辨識 upstream iterator 中哪些候選屬於這個可視頁；超出範圍的預取候選照常 yield，但不 submit。每個 filter callback 最多建立一個 batch，最後不足一頁時使用實際數量。filter 始終保持「consume 一個 candidate 後正常 yield」的 librime-lua lazy 模型，只在可視頁尾 candidate yield 前完成 submit。換頁則由 `update_notifier` 在 librime 已完成 destination page preparation 與 highlight 後讀取已存在的 Menu 候選；此路徑也不呼叫 `prepare()`。兩條路徑共同避免 Menu 重入、無 yield 預讀，以及後續預取頁覆蓋目前可視頁 state。
+
+## 密碼欄與 loopback fail closed
+
+Lua 不傳 composition 或 context；V0.3 request 只含需要翻譯的候選文字。即使如此，worker 在任何 HTTP body 離開 Weasel process 前仍必須：
+
+1. 取得非零 foreground HWND/PID；
+2. 在 worker COM apartment 用 UI Automation 取得當前 focused element；
+3. 成功讀到 `IsPassword == false`（未知、錯誤、timeout、unsupported 均不算 safe）；
+4. 緊接送出前再次取得 foreground HWND/PID，且必須與步驟 1 完全一致；
+5. 確認 Helper endpoint 是 `http://127.0.0.1:<port>`，不接受 hostname、IPv6、redirect 或 proxy。
+
+只有全部明確 safe 才送出；否則 terminal status 為 `unsafe`/`focus_changed` 並靜默省略英文。安全檢查不得退回「假設不是密碼欄」。Helper/模型也不得提供外網 fallback。
+
+## Cache、dedup 與故障
+
+- Lua dictionary/snapshot hit 不得提交 Helper。
+- Helper v2 對每個 miss 先查 SQLite `zh/en/literal`；全 hit 時不呼叫模型。partial miss 仍由 Rime/bridge 以一個 page request 傳入，但 Helper 會將 ordered unique misses 逐一做 singleton model inference，再按原 slot 合成完整結果。這是刻意的品質隔離：小模型不得讓同頁相近候選彼此串義。
+- 同 model identity、translation mode 與相同 ordered miss batch 的並行 request 共用一個 in-flight inference；各 caller 仍取得自己的 request id/generation/fingerprint envelope。
+- 經嚴格驗證的模型結果才可 transactionally upsert SQLite。失敗、timeout、stale 或不安全結果不可寫成翻譯。
+- AI cache 是可丟棄的最佳化資料；`scripts/cache.ps1 purge-model` 只刪除 provenance 為 `model:*` 的項目並保留 manual/import rows，之後必須重新 `publish` snapshot。這用於模型/prompt/mapping bug 曾污染 cache 時的安全復原。
+- queue full、bridge disabled、Helper/model 不可用、timeout、invalid output、cache 損壞與 native panic/exception 都只造成英文缺席。所有跨 Lua/C boundary 的例外必須轉成狀態；filter/processor 以 `pcall` 做最後隔離。
+
+## V0.3 驗收
+
+- 證明 callback 路徑沒有檔案/SQLite/HTTP/UIA/process launch，也沒有 blocking lock wait；queue full 立即 fail open。
+- dictionary/snapshot hit 零 Helper call；相同 ordered miss batch 仍共用同一個 in-flight Helper task；partial cache miss 的每個 unique miss 各做一次 singleton model inference，全部成功後才一次 transaction 寫 cache 並依原順序重組 response。
+- 模擬快速連續輸入、選取移動和 PageUp/PageDown，舊 generation/fingerprint 結果不顯示，順序與選取不變。
+- UIA unknown/error/`IsPassword=true`、foreground PID 改變、非 loopback endpoint 均為零 HTTP request。
+- Helper v1 測試仍通過；v2 success/error/limits/cache/dedup/timeout 測試通過。
+- 驗證停住不按鍵時不主動刷新；filter 不重跑的情況下，下一次真實鍵盤事件會由 processor 對仍有效 refs 套用 ready translation，且 generation/page/identity 改變時不會套到舊 refs。
+- 實機驗證正常拼音、Space/數字/方向鍵選字、PageUp/PageDown、直列候選，以及 Helper/model unavailable 時無可感知卡頓。雙語翻譯 UI 僅支援直列；橫列不是本功能的驗收模式。
+
+---
+
+## V0.2-ai 基線（保留供相容性參考）
+
+## 交付邊界
+
+V0.2-ai 在既有 V0.2 的 Rime 註解與本機 cache 基礎上，加入可獨立部署、測試的本機 AI 翻譯資料流：
+
+```text
+一頁中文候選（batch）
+  -> Translation Helper
+  -> http://127.0.0.1:<llama-port>
+  -> llama-server
+  -> Gemma 3 1B IT QAT Q4_0 GGUF
+  -> 經驗證、順序不變的英文字串陣列
+```
+
+這一版的完成條件是：安裝本機推理 runtime 與模型後，可從 Helper 的批次介面送入一頁候選，經由 llama-server 取得並驗證等長的翻譯結果。模型名稱、GGUF 路徑與 llama-server 參數由 Helper／部署設定決定，不寫死在 Rime Lua。
+
+V0.2-ai **不把 Helper 呼叫接進 Rime 打字事件**。Rime 打字時自動送出 request、非同步輪詢、candidate fingerprint、stale result 丟棄與稍後刷新 comment 屬 V0.3。V0.2-ai 的批次 E2E 測試從 Helper API／CLI 邊界開始，使用與 Rime 當頁候選相同形狀的資料；它不是日常打字時的同步呼叫。
+
+因此，V0.2-ai 不宣稱已提供下列能力：
+
+- 打字時自動觸發 AI 翻譯或即時補上英文。
+- 上下文選義；`context` 欄位在本版保持空字串，V0.4 才啟用其語意。
+- 英文上屏快捷鍵、模型 idle unload 或 Weasel C++ 雙層 UI。
+- 把模型輸出自動寫入 SQLite 或發布成 Rime snapshot。
+
+這個邊界刻意確保「模型可部署、Helper batch 可端到端運作」不會把網路或推理延遲帶進輸入法程序。
+
+## 不變條件
+
+- 候選文字、順序、分頁、quality 與選取身份完全由原 schema 決定。
+- Space、數字鍵、方向鍵及 PageUp/PageDown 行為不變。
+- Rime 打字熱路徑不開 SQLite、不做檔案 I/O、不啟動程序、不送 HTTP，也不等待 Helper 或模型。
+- dictionary、cache、Helper 或模型任一項缺失或失敗時，中文候選與選字都必須正常。
+- 本機 dictionary／cache 必須先於任何未來的 AI request；cache hit 不得呼叫模型。
+- V0.2-ai 不蒐集密碼欄內容。未來加入 Rime IPC 時，無法確認欄位安全就不得送出 composition、上下文或候選。
+- Weasel 只允許 exact 0.17.4 的最小可重現 patch：新增 private completion message 與 main-thread Rime refresh handler；不得改候選排序、commit、TSF key handling 或 renderer。英文仍透過原生 candidate comment 顯示。
+
+## 元件與信任邊界
+
+```text
+Rime / Weasel process                         管理與測試程序
+------------------------------------          --------------------------------
+schema init                                   caller / E2E test
+  -> load built-in dictionary                   -> POST /translate (batch)
+  -> load canonical snapshot once               -> Translation Helper
+candidate hot path                                    -> validate request
+  -> dictionary lookup                                 -> fixed prompt
+  -> snapshot lookup                                   -> loopback HTTP
+  -> optional comment                            llama-server
+  -> yield original candidate                          -> local GGUF
+                                                    <- model text
+                                                 <- strict validated JSON
+```
+
+Translation Helper 與 llama-server 是 Rime 程序外的本機程序。兩者之間只使用 loopback HTTP；Helper 不依賴 Gemma 專屬 API，而是依賴 llama-server 的 OpenAI-compatible chat completion 介面。部署時預設模型為 Gemma 3 1B IT QAT Q4_0 GGUF；更換其他 GGUF instruct model 只改部署設定與 model identity。
+
+V0.2-ai 的 Helper 可以同步等待 llama-server，因為 caller 是獨立管理／測試程序，不是 Rime filter 或 processor。後續 Rime 整合必須在此介面前增加真正的非同步邊界，不能直接從同步 Lua filter 呼叫 `/translate`。
+
+## Helper HTTP 契約
+
+Helper 只監聽 `127.0.0.1`。V0.2-ai 提供下列版本化介面：
+
+```text
+POST /translate
+GET  /health
+```
+
+### `POST /translate`
+
+Request 使用 UTF-8 JSON：
+
+```json
+{
+  "protocol_version": 1,
+  "request_id": "e2e-0001",
+  "context": "",
+  "candidates": ["我", "你", "今天"]
+}
+```
+
+欄位契約：
+
+| 欄位 | 規則 |
 | --- | --- |
-| `lua/rime_bilingual.lua` | filter 初始化與候選處理；實作 dictionary-first、cache-second 查詢。 |
-| `lua/rime_bilingual_dictionary.lua` | V0.1 延續的內建唯讀高頻詞典。 |
-| `lua/rime_bilingual_cache.lua` | 以受限環境載入並驗證 snapshot；失敗時回傳空 cache。 |
-| `rime_ice.custom.yaml` | 在最後一個 `uniquifier` 前插入 filter，並提供 V0.2 設定。 |
-| `data/cache_schema.sql` | SQLite schema 的可讀參考定義。 |
-| `scripts/cache.ps1` | cache CLI：`init`、`put`、`import`、`publish`、`validate`。 |
-| `scripts/lib/rime_bilingual_sqlite.psm1` | Windows SQLite ABI、schema、transaction、匯入與原子 snapshot 發布。 |
-| `scripts/install.ps1` | 全新安裝或從受管理 V0.1 原地升級；初始化 DB 並發布 snapshot。 |
-| `scripts/uninstall.ps1` | 還原受管理檔案；預設保留 cache，選用 `-PurgeCache` 刪除。 |
+| `protocol_version` | 必須為整數 `1`；未知版本拒絕處理。 |
+| `request_id` | caller 產生的非空字串；只用於關聯 request／response，不作候選身份。 |
+| `context` | V0.2-ai 必須是空字串；欄位保留供 V0.4 啟用。 |
+| `candidates` | 1～20 個非空 UTF-8 字串，陣列順序就是輸出順序；禁止逐候選拆成多次 inference。 |
 
-預設資料位置：
+成功時回傳 HTTP 200：
+
+```json
+{
+  "protocol_version": 1,
+  "request_id": "e2e-0001",
+  "translations": ["I", "You", "Today"],
+  "model": "gemma-3-1b-it-qat-q4_0",
+  "elapsed_ms": 184
+}
+```
+
+`translations` 必須與 `candidates` 等長、逐項為非空短字串，且索引一一對應。Helper 必須先完成整份驗證才回傳成功；不得回傳部分結果、重排結果或拿上一個 request 的結果補洞。`model` 是實際部署 identity，供診斷與未來 cache invalidation；`elapsed_ms` 是 Helper 觀測到的本次處理時間，不包含任何 Rime UI 承諾。
+
+失敗時使用非 2xx 狀態並回傳：
+
+```json
+{
+  "protocol_version": 1,
+  "request_id": "e2e-0001",
+  "error": {
+    "code": "MODEL_OUTPUT_INVALID",
+    "message": "model output did not match the requested batch",
+    "retryable": true
+  }
+}
+```
+
+錯誤 code 至少區分 `INVALID_REQUEST`、`MODEL_UNAVAILABLE`、`MODEL_TIMEOUT` 與 `MODEL_OUTPUT_INVALID`。對 malformed JSON、陣列長度不符、非字串項目、空翻譯、過長翻譯或模型多餘說明，Helper 一律視為失敗，不把垃圾內容交給 caller。有限 retry 可在 Helper 內進行，但必須受 timeout 約束；失敗不會影響 Rime。
+
+### `GET /health`
+
+`/health` 只報告 Helper 是否可回應以及設定的 llama endpoint／model identity 是否就緒，不載入模型、不執行 inference，也不延長未來的模型 keep-alive。健康檢查不得回傳 prompt、候選、翻譯內容或本機敏感路徑。
+
+## Helper 到 llama-server 的模型契約
+
+Helper 呼叫設定的 loopback llama-server chat completion endpoint，固定使用短 system prompt：將一批中文輸入法候選翻成自然、精簡的英文；保留順序；只輸出 JSON string array。V0.2-ai 的 prompt 不提供最近輸入上下文。
+
+初始推理設定以部署 benchmark 調整，預設範圍為：
+
+```text
+context size: 256～512 tokens
+temperature: 0～0.2
+output budget: 足以容納一頁短翻譯，但限制長篇生成
+GPU offload: 可設定，優先使用可用 GPU
+```
+
+Helper 不信任模型文字。即使 llama-server 回傳 HTTP 200，仍必須抽取 assistant content、解析 JSON、驗證數量／型別／長度，最後才建立 Helper response。Markdown code fence、解釋文字或其他非 JSON array 輸出都不能直接顯示。
+
+## Loopback 與隱私
+
+- Helper server 與 llama-server 都明確 bind `127.0.0.1`，不可使用 `0.0.0.0`、`::` 或 LAN 位址作為預設值。
+- Helper 只接受設定為 `http://127.0.0.1:<port>` 的模型 endpoint；V0.2-ai 不提供雲端 fallback、外部帳號或 API key。
+- 模型與 runtime 安裝完成後，翻譯資料流不需要對外網路。下載工具必須與執行時翻譯程序分離。
+- 日誌預設只記錄時間、request id、batch size、model identity、latency 與錯誤 code；不記錄 context、candidate、prompt 或 translation 內容。
+- `/translate` 不提供 CORS 公開存取能力，也不因模型失敗轉送至其他服務。
+- 未來 Rime caller 必須在 password／sensitive input 狀態停用請求；安全狀態未知時採 fail closed。
+
+## 資料與安裝目錄
+
+Rime 可攜設定與既有 cache 維持原位置：
 
 ```text
 %APPDATA%\Rime\rime-bilingual\translations.db
 %APPDATA%\Rime\rime-bilingual\cache_snapshot.lua
 ```
 
-## SQLite 資料契約
-
-資料庫以 application id `RBIL`、`PRAGMA user_version = 1` 識別。`translations` 的主鍵為：
+大型、機器相依且不可提交 Git 的本機 AI 資產放在：
 
 ```text
-(source_text, source_language, target_language, translation_mode)
+%LOCALAPPDATA%\RimeBilingual\config.json
+%LOCALAPPDATA%\RimeBilingual\runtime\llama.cpp\<version>\
+%LOCALAPPDATA%\RimeBilingual\models\gemma-3-1b-it-qat-q4_0\<model>.gguf
+%LOCALAPPDATA%\RimeBilingual\logs\
 ```
 
-紀錄同時保存 `translated_text`、來源標記 `source` 與 `updated_at_utc`。`cache_meta` 保存單一非負 `revision`；每次成功的 `put` 或整批 `import` transaction 增加一次 revision。V0.2 CLI 與 Rime runtime 固定使用：
+`config.json` 只保存 loopback ports、model identity、GGUF 路徑、context size、temperature、timeout 與 offload 設定，不保存候選或上下文。下載中的檔案先放同一資產目錄的暫存名稱；下載、大小／hash 驗證與原子改名成功後才能被設定引用。GGUF、llama.cpp binary、暫存下載與 runtime log 不屬於 repository payload。
+
+## 既有 Rime dictionary／cache 熱路徑
+
+V0.2-ai 保留 V0.2 的讀寫分離設計，不把 AI call 塞進現有 filter：
 
 ```text
-source_language = zh
-target_language = en
-translation_mode = literal
+管理端（不在打字熱路徑）
+scripts/cache.ps1
+  -> init / put / import
+  -> SQLite translations.db
+  -> publish
+  -> canonical cache_snapshot.lua
+
+Rime schema 初始化
+  -> 載入內建 Lua 詞典
+  -> 驗證並載入 snapshot 一次
+  -> 建立記憶體 table
+
+每個候選
+  -> dictionary[candidate.text]
+  -> miss 時查 snapshot_cache[candidate.text]
+  -> 命中時只改 genuine candidate.comment
+  -> yield 原 candidate
 ```
 
-寫入採參數化 SQL 與 transaction。遇到 application id、schema version 或資料表契約不相容的既有檔案時，工具拒絕修改，而不是猜測或自動遷移。
+目前優先順序維持 `dictionary` first、`snapshot cache` second；二者都 miss 時，候選保持不變。V0.2-ai Helper 的結果不會自動穿越這個邊界。若管理者要讓既有 Rime 顯示某批已核對的結果，仍使用既有 `cache.ps1 put/import`、`publish` 與重新部署流程；這是離線管理動作，不是即時 AI 更新。
 
-## Canonical snapshot 契約
+SQLite 仍是可寫持久資料，canonical snapshot 仍是 Rime 唯一讀取的執行期投影。既有 application id `RBIL`、`user_version = 1`、固定 `zh/en/literal` tuple、revision、canonical parser、容量限制與原子發布契約都不變。
 
-`publish` 在一致的 SQLite transaction 視圖中取得 revision 與 `zh/en/literal` entries，按 `source_text COLLATE BINARY` 排序，產生 UTF-8（無 BOM）的確定性 Lua table：
+## V0.2 → V0.2-ai 升級策略
 
-```lua
-return {
-  format_version = 1,
-  db_schema_version = 1,
-  revision = 3,
-  source_language = 'zh',
-  target_language = 'en',
-  translation_mode = 'literal',
-  entries = {
-    ['一言難盡'] = 'It\'s hard to explain.',
-  },
-}
-```
+升級採 additive、可回退策略：
 
-相同 DB revision 與內容會產生位元一致的 snapshot。字串經 Lua escaping，資料中看似 Lua 程式的內容仍只是字串。發布前會套用與 runtime 相同的 10,000 筆、每個 key/value 4,096 UTF-8 bytes、snapshot 16 MiB 上限；之後才完整寫入同目錄暫存檔並以同磁碟區原子替換。若驗證或替換失敗，上一份 snapshot 保持不變。
+1. 先驗證現有受管理 V0.2 manifest 與 payload；不覆寫使用者修改的 Rime 檔案。
+2. 保留 `%APPDATA%\Rime\rime-bilingual` 的 SQLite、snapshot、revision 與既有備份。
+3. 將 Helper、llama.cpp runtime、model 與本機設定安裝至 `%LOCALAPPDATA%\RimeBilingual`；Rime Lua 與 schema patch 不需要為批次 E2E 改動。
+4. 驗證 binary／GGUF 後，先啟動只綁 loopback 的 llama-server，再啟動 Helper，依序檢查 `/health` 與一個 batch translation smoke test。
+5. 任一步驟失敗都停止新增的本機 AI 程序並回復本次新增／替換的 AI 資產；不得刪除或重建既有 Rime cache。
 
-Lua loader 不執行 snapshot chunk，而是以 bounded canonical parser 讀取固定欄位順序與字串 escaping。它拒絕額外 token、函式或迴圈、重複／未排序 key、無效 UTF-8、錯誤版本與 tuple，以及超過上述容量上限的資料。任何讀取或解析失敗都會記錄一次 warning 並丟棄整份 snapshot，以空 cache 繼續。
+移除 V0.2-ai 時，AI runtime、model、Helper 設定與 logs 必須與 Rime payload 分開處理。預設保留使用者的 `translations.db`／snapshot；刪除模型或 cache 都需要明確的 purge 選項。回退到 V0.2 只停用／移除 AI 元件，原本的 dictionary／snapshot 註解繼續工作。
 
-`validate` 會驗證 SQLite schema；snapshot 存在或明確指定時，也會確認 snapshot revision 與 DB 一致。
+## 故障行為
 
-## 候選資料契約與優先順序
-
-filter 對 `candidate.text` 做精確比對：
-
-```text
-translation = dictionary[candidate.text]
-if translation == nil:
-    translation = cache[candidate.text]
-```
-
-因此內建詞典永遠優先，cache 無法覆寫同 key 的內建翻譯。命中時只設定 `candidate:get_genuine().comment`，並 yield 原 candidate；`type`、`text`、quality、起訖範圍、身份及串流順序不變。未命中時完全不改候選。
-
-V0.2 採精確字串 key，不做繁簡轉換、詞形變化、語境消歧或大小寫推斷。
-
-## Schema 整合與設定
-
-`rime_ice.custom.yaml` 是使用者 patch，不是上游 schema 副本。filter 以 `engine/filters/@before last` 插在最後一個 `uniquifier` 前：此前的翻譯器、排序器與簡繁轉換已完成，comment 又能在候選被去重包裝前寫入。
-
-設定介面：
-
-| 鍵 | 預設值 | 用途 |
-| --- | --- | --- |
-| `enabled` | `true` | 啟用所有雙語註解。 |
-| `cache_enabled` | `true` | schema 初始化時載入 snapshot；停用後仍查內建詞典。 |
-| `comment_prefix` | `""` | 英文翻譯前綴。 |
-| `comment_separator` | `" · "` | 既有 comment 與英文之間的分隔字串。 |
-| `preserve_existing_comment` | `true` | 保留並接續既有 comment。 |
-
-所有設定都在 schema 初始化時讀取，修改後必須重新部署。
-
-## 安裝、升級與資料生命週期
-
-全新安裝會部署三個 Lua 檔案及 schema patch，初始化 SQLite，發布空或既有 DB 的 snapshot，最後寫入 V0.2 manifest。若目的地已有不受管理的同名檔案，安裝程式會先備份，卸載時還原。
-
-受管理的 V0.1 安裝可用相同 `install.ps1` 原地升級。升級前會驗證 V0.1 manifest、三個既有 payload hash 及備份；升級成功後才以 V0.2 manifest 取代舊 manifest。安裝中途失敗會回復 payload、snapshot 及新建 DB；若 rollback 不完整則保留復原資料並明確報錯。
-
-卸載依 manifest hash 保護受管理檔案，拒絕無提示刪除使用者修改。預設只移除 payload、manifest 與專案備份，保留 `%RimeUserDir%\rime-bilingual` 中的 DB 和 snapshot；使用者明確指定 `-PurgeCache` 時才遞迴刪除該資料目錄。
-
-安裝、升級、發布、設定修改及卸載都不會讓現有 Rime schema 熱更新；必須重新部署才會生效。
-
-## Cache CLI 邊界
-
-| 命令 | 行為 |
+| 故障 | V0.2-ai 行為 |
 | --- | --- |
-| `init` | 建立相容 SQLite schema，或驗證既有 schema。 |
-| `put` | 對固定 runtime tuple upsert 單筆資料，revision 加一。 |
-| `import` | 從 CSV、TSV 或 JSON 驗證並以單一 transaction upsert 整批資料，revision 加一。 |
-| `publish` | 由 DB 建立 canonical snapshot 並原子發布。 |
-| `validate` | 驗證 DB，並在 snapshot 存在時驗證 snapshot/revision。 |
+| Helper 未啟動 | batch caller 收到連線失敗；Rime 不受影響。 |
+| llama-server 未啟動／模型未載入 | Helper 回 `MODEL_UNAVAILABLE`；不回傳假翻譯。 |
+| 模型 timeout | Helper 終止該次等待並回 `MODEL_TIMEOUT`；不產生部分結果。 |
+| 模型輸出格式錯誤 | Helper 回 `MODEL_OUTPUT_INVALID`；不發布、不顯示。 |
+| AI 資產缺失或設定無效 | 部署／health check 失敗；既有 V0.2 繼續工作。 |
+| SQLite／snapshot 缺失或無效 | Lua loader 使用空 cache；dictionary 與中文候選繼續工作。 |
+| dictionary 與 cache 都 miss | 原候選不加英文、順序與選取身份不變。 |
 
-`put` 與 `import` 不會隱式 publish；`publish` 也不會觸發 Weasel 重新部署。這個分離使資料編輯、snapshot 發布與輸入法重載都是明確、可驗證的步驟。
+所有 AI 故障都發生在 Rime 程序外。V0.3 即使加入自動 request，也必須維持相同行為：中文先顯示，英文允許缺席，任何模型狀態都不能阻塞輸入、選字或翻頁。
 
-## 效能、故障與隱私
+## V0.2-ai 驗收
 
-filter 初始化最多做一次 snapshot 檔案載入與驗證；每個候選的熱路徑最多做兩次 O(1) Lua table lookup 及一次 comment 寫入。沒有 SQLite、HTTP、API key、背景程序或 retry。
+自動化／命令列驗證至少涵蓋：
 
-snapshot 缺失、不可讀、格式錯誤或過大時，loader 回退至空 cache；內建詞典仍可用。SQLite 或 publish 錯誤發生在獨立 CLI，不會阻塞候選 UI。外部翻譯與密碼欄資料保護屬後續版本，但 V0.2 完全沒有網路傳輸能力。
+- Helper 拒絕錯誤 protocol、空／過大 batch 與非空 context。
+- 一個 batch 只觸發一次 inference，輸出順序及數量與輸入一致。
+- llama-server 使用指定 Gemma GGUF 在 loopback 提供服務，Helper 可完成真實 batch smoke test。
+- 模型回傳 malformed JSON、錯誤數量、非字串、空字串或冗長內容時，Helper fail closed。
+- Helper／llama-server 僅綁 `127.0.0.1`，設定拒絕非 loopback endpoint。
+- 模型未載入、server 中斷與 timeout 時回傳明確錯誤，且既有 Rime 測試仍通過。
+- 從 V0.2 升級及回退不變更既有 DB、snapshot、Rime payload 或候選熱路徑。
+- 日誌不含候選、context、prompt 或翻譯文字。
 
-## V0.2 驗收界線
-
-自動化測試必須涵蓋：
-
-- SQLite schema、固定 runtime tuple、parameterized upsert/import 與 revision。
-- canonical escaping、確定性排序、原子發布、失敗時保留舊 snapshot。
-- snapshot 安全載入、格式與容量限制、錯誤時空 cache fallback。
-- dictionary 命中優先於 cache、cache-only 命中、miss 不變。
-- 候選身份、欄位、順序、既有 comment 與停用設定。
-- 全新安裝、V0.1 原地升級、rollback、預設保留 cache、`-PurgeCache`。
-
-Windows 上仍必須人工確認正常拼音、Space／數字鍵／方向鍵選字、PageUp/PageDown 翻頁、橫向與豎向版面，以及快速連續輸入時無可感知停頓。這些真正的 Weasel／librime-lua 驗證不能由靜態模型測試取代。
+既有 Rime 自動化與 Windows 人工驗收仍不可省略：正常拼音、Space／數字鍵／方向鍵選字、PageUp/PageDown、橫向與豎向候選版面，以及快速連續輸入時無可感知停頓。V0.2-ai 的模型 smoke test 與這些 Rime 回歸測試是兩組獨立驗收，前者不得以同步方式嵌入後者。
 
 ## 後續演進
 
-V0.3 才由獨立 Helper 非同步取得外部翻譯並寫入 SQLite。即使後續加入 Google 或 AI，Rime 的同步 filter 仍只讀已發布的本機 snapshot；網路請求不得進入候選熱路徑。
+- V0.3（本文件頂部定義）：在 Rime 與 Helper 之間加入非同步 request／result 通道、timeout、去重、candidate fingerprint 與 stale result 丟棄；cache hit 仍先行，AI miss 才送出。
+- V0.4：Helper/backend 已加入 protocol v3 bounded context、contextual cache namespace 與 English-only model output validation；Rime/native bridge 暫時維持 v2 空 context，直到 recent committed context 能附帶可驗證的安全來源，避免把先前敏感欄位文字帶到後續 request。contextual cache 以 model identity、prompt 與 normalized context 的 SHA-256 放入既有 `translation_mode`，不把 raw context 存入 SQLite。
+- V0.5：加入可配置英文 commit shortcut。
+- V0.6：加入／確認 idle 600 秒 unload、冷啟動恢復與 VRAM 釋放；只有真正 inference 重置 timer。
+
+若原生 comment UI 最終不足以提供可接受的橫／豎向雙語關係，才另案評估 Weasel UI 修改；不在 V0.2-ai 範圍內。
