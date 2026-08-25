@@ -23,7 +23,7 @@ $product = 'rime-bilingual-weasel-host'
 $weaselVersion = '0.17.4'
 $expectedRimeSha256 = '2D8F1BC3737635A11D9FB1BFCA4DC9E70533633930A8A0142A81CA879C39C45B'
 $expectedOfficialServerSha256 = 'FEF5AF4516092A1CA26E4E307D118583AD3FF5DF547A35FB66CB490FF99EF35B'
-$refreshMarker = '_rime_bilingual_refresh'
+$expectedPatchedServerSha256 = '2FBC1F0914FA2CF2D13245874FCF64B9826B972C4B0B93EC3A53D9AAD224E77D'
 
 function Get-NormalizedPath([string]$Path) {
     $fullPath = [IO.Path]::GetFullPath($Path)
@@ -77,11 +77,6 @@ function Get-PEMachine([string]$Path) {
         throw "Not a valid PE image: '$Path'."
     }
     [BitConverter]::ToUInt16($bytes, $pe + 4)
-}
-
-function Test-AsciiMarker([string]$Path, [string]$Marker) {
-    $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Path))
-    $text.IndexOf($Marker, [StringComparison]::Ordinal) -ge 0
 }
 
 function Get-SupportedWeaselProcesses([string]$ServerPath) {
@@ -195,13 +190,12 @@ if ((Get-Sha256 $rimePath) -cne $expectedRimeSha256) {
 if ((Get-PEMachine $serverPath) -ne 0x8664 -or (Get-PEMachine $PatchedWeaselServerPath) -ne 0x8664) {
     throw 'Both official and patched WeaselServer images must be x64.'
 }
-if (-not (Test-AsciiMarker $PatchedWeaselServerPath $refreshMarker)) {
-    throw "Patched WeaselServer artifact does not contain the expected refresh marker '$refreshMarker'."
-}
-
 $patchedSha256 = Get-Sha256 $PatchedWeaselServerPath
 if ($patchedSha256 -ceq $expectedOfficialServerSha256) {
     throw 'Patched WeaselServer artifact is identical to the official server.'
+}
+if (-not $DevelopmentNoProcessControl -and $patchedSha256 -cne $expectedPatchedServerSha256) {
+    throw "Unsupported patched WeaselServer artifact; expected SHA-256 $expectedPatchedServerSha256 but found $patchedSha256."
 }
 
 if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
@@ -274,7 +268,6 @@ try {
         originalSha256 = $expectedOfficialServerSha256
         patchedSha256 = $patchedSha256
         backupRelativePath = '.rime-bilingual-weasel-host\official-WeaselServer.exe'
-        refreshMarker = $refreshMarker
     }
     $manifestTemp = $manifestPath + '.tmp-' + [guid]::NewGuid().ToString('N')
     New-Item -ItemType Directory -Path $RimeUserDir -Force | Out-Null
