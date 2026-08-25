@@ -157,7 +157,18 @@ function Start-SupportedWeasel([string]$ServerPath) {
 }
 
 function Invoke-WeaselDeploy([string]$DeployerPath) {
-    $process = Start-Process -FilePath $DeployerPath -ArgumentList '/deploy' -WorkingDirectory (Split-Path -Parent $DeployerPath) -Wait -PassThru
+    $process = Start-Process -FilePath $DeployerPath -ArgumentList '/deploy' -WorkingDirectory (Split-Path -Parent $DeployerPath) -PassThru
+    $timedOut = $false
+    try { Wait-Process -Id $process.Id -Timeout 120 -ErrorAction Stop }
+    catch {
+        if ($null -ne (Get-Process -Id $process.Id -ErrorAction SilentlyContinue)) {
+            $timedOut = $true
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            try { Wait-Process -Id $process.Id -Timeout 5 -ErrorAction SilentlyContinue } catch { }
+        }
+    }
+    if ($timedOut) { throw 'Weasel deploy timed out after 120 seconds.' }
+    $process.Refresh()
     if ($process.ExitCode -ne 0) {
         throw "Weasel deploy failed with exit code $($process.ExitCode)."
     }
@@ -253,6 +264,7 @@ try {
     }
 
     if (-not $DevelopmentNoProcessControl) {
+        Start-SupportedWeasel $serverPath
         Invoke-WeaselDeploy $deployerPath
         Start-SupportedWeasel $serverPath
     }

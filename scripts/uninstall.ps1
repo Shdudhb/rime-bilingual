@@ -192,7 +192,23 @@ function Start-SupportedWeasel([string]$WeaselServerPath) {
 
 function Deploy-And-StartSupportedWeasel([string]$WeaselDeployerPath, [string]$WeaselServerPath) {
     $workingDirectory = Split-Path -Parent $WeaselDeployerPath
-    $deployer = Start-Process -FilePath $WeaselDeployerPath -ArgumentList '/deploy' -WorkingDirectory $workingDirectory -Wait -PassThru
+    # WeaselDeployer /deploy calls Client.Connect() before deployment. If the
+    # server is fully stopped, the upstream named-pipe client can wait forever.
+    # Start the exact supported server first; the deployer then puts it into
+    # maintenance mode and resumes it after the workspace update.
+    Start-SupportedWeasel $WeaselServerPath
+    $deployer = Start-Process -FilePath $WeaselDeployerPath -ArgumentList '/deploy' -WorkingDirectory $workingDirectory -PassThru
+    $timedOut = $false
+    try { Wait-Process -Id $deployer.Id -Timeout 120 -ErrorAction Stop }
+    catch {
+        if ($null -ne (Get-Process -Id $deployer.Id -ErrorAction SilentlyContinue)) {
+            $timedOut = $true
+            Stop-Process -Id $deployer.Id -Force -ErrorAction SilentlyContinue
+            try { Wait-Process -Id $deployer.Id -Timeout 5 -ErrorAction SilentlyContinue } catch { }
+        }
+    }
+    if ($timedOut) { throw 'Weasel redeploy timed out after 120 seconds.' }
+    $deployer.Refresh()
     if ($deployer.ExitCode -ne 0) {
         throw "Weasel redeploy failed with exit code $($deployer.ExitCode)."
     }
