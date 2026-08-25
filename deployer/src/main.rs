@@ -19,8 +19,7 @@ const APP_NAME: &str = "rime.weasel";
 type RimeBool = c_int;
 type RimeSetup = unsafe extern "C" fn(*mut RimeTraits);
 type RimeDeployerInitialize = unsafe extern "C" fn(*mut RimeTraits);
-type RimeDeployWorkspace = unsafe extern "C" fn() -> RimeBool;
-type RimeDeployConfigFile = unsafe extern "C" fn(*const c_char, *const c_char) -> RimeBool;
+type RimeDeploySchema = unsafe extern "C" fn(*const c_char) -> RimeBool;
 type RimeFinalize = unsafe extern "C" fn();
 
 #[repr(C)]
@@ -119,10 +118,11 @@ fn run() -> Result<(), String> {
     validate_options(&options)?;
     if options.dry_run {
         println!(
-            "RimeBilingualDeploy validation passed: rime='{}', shared='{}', user='{}'",
+            "RimeBilingualDeploy validation passed: rime='{}', shared='{}', user='{}', schema='{}'",
             options.rime_dll.display(),
             options.shared_data_dir.display(),
-            options.user_data_dir.display()
+            options.user_data_dir.display(),
+            options.user_data_dir.join("rime_ice.schema.yaml").display()
         );
         return Ok(());
     }
@@ -192,6 +192,13 @@ fn validate_options(options: &Options) -> Result<(), String> {
             options.user_data_dir.display()
         ));
     }
+    let schema_path = options.user_data_dir.join("rime_ice.schema.yaml");
+    if !schema_path.is_file() {
+        return Err(format!(
+            "rime_ice schema source is missing: {}",
+            schema_path.display()
+        ));
+    }
     let actual = sha256_file(&options.rime_dll)?;
     if !actual.eq_ignore_ascii_case(EXPECTED_RIME_SHA256) {
         return Err(format!(
@@ -212,18 +219,13 @@ fn deploy(options: &Options) -> Result<(), String> {
         library.get::<RimeDeployerInitialize>(b"RimeDeployerInitialize\0")
     }
     .map_err(|e| format!("RimeDeployerInitialize export unavailable: {e}"))?;
-    let deploy_workspace = unsafe { library.get::<RimeDeployWorkspace>(b"RimeDeployWorkspace\0") }
-        .map_err(|e| format!("RimeDeployWorkspace export unavailable: {e}"))?;
-    let deploy_config_file = unsafe {
-        library.get::<RimeDeployConfigFile>(b"RimeDeployConfigFile\0")
-    }
-    .map_err(|e| format!("RimeDeployConfigFile export unavailable: {e}"))?;
+    let deploy_schema = unsafe { library.get::<RimeDeploySchema>(b"RimeDeploySchema\0") }
+        .map_err(|e| format!("RimeDeploySchema export unavailable: {e}"))?;
     let finalize = unsafe { library.get::<RimeFinalize>(b"RimeFinalize\0") }
         .map_err(|e| format!("RimeFinalize export unavailable: {e}"))?;
 
     let mut traits = OwnedTraits::new(&options.shared_data_dir, &options.user_data_dir)?;
-    let weasel_yaml = cstring("weasel.yaml", "Weasel config file")?;
-    let config_version = cstring("config_version", "Weasel config version key")?;
+    let schema_path = path_cstring(&options.user_data_dir.join("rime_ice.schema.yaml"))?;
 
     unsafe {
         setup(&mut traits.traits);
@@ -232,17 +234,11 @@ fn deploy(options: &Options) -> Result<(), String> {
         deployer_initialize(ptr::null_mut());
     }
 
-    let result = (|| {
-        let workspace_ok = unsafe { deploy_workspace() } != 0;
-        if !workspace_ok {
-            return Err("RimeDeployWorkspace reported failure".to_string());
-        }
-        let weasel_ok = unsafe { deploy_config_file(weasel_yaml.as_ptr(), config_version.as_ptr()) } != 0;
-        if !weasel_ok {
-            return Err("RimeDeployConfigFile(weasel.yaml) reported failure".to_string());
-        }
+    let result = if unsafe { deploy_schema(schema_path.as_ptr()) } != 0 {
         Ok(())
-    })();
+    } else {
+        Err("RimeDeploySchema(rime_ice.schema.yaml) reported failure".to_string())
+    };
 
     unsafe { finalize() };
     result
